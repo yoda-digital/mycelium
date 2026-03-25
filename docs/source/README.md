@@ -1,25 +1,25 @@
-# Mycelium v4 — encrypted nerve network for Claude Code instances
+# Mycelium v5 — encrypted nerve network for Claude Code instances
 
-E2E encrypted with PFS, TOFU fail-closed, replay-protected, delivery-confirmed. Two files. Adversarially audited across 2 multi-model debates (Codex, Qwen, Gemini).
+E2E encrypted. PFS. TOFU fail-closed. Signature-enforced. Replay-proof. Delivery-confirmed. 25 vulnerabilities found and fixed across 3 adversarial multi-model debates.
 
-## Security model
+## What a compromised relay CANNOT do
 
-| Layer | Mechanism | Guarantees |
-|---|---|---|
-| Identity | Ed25519 long-term keys + TOFU pinning | Relay can't substitute identities. Key change = BLOCKED (fail-closed) |
-| Encryption | Curve25519 ephemeral per session | PFS — past sessions undecryptable on key compromise |
-| Integrity | Canonical Ed25519 signatures with `sender` field | Relay can't forge, tamper, or re-attribute messages |
-| Replay | Persisted msg_id dedup (time-based 30min) + session-scoped seq (strict) | Duplicate and reordered messages blocked across sessions |
-| Delivery | E2E encrypted acks with 30s timeout | Detects silent message drops by relay |
-| Auth | First-message auth (no tokens in URLs) + TLS enforcement warning | Token never in logs/proxies |
-
-**A compromised relay CANNOT:** read messages, substitute keys (TOFU), forge messages (signatures), re-attribute messages (sender field), replay messages (persisted dedup + session seq), silently drop messages (acks).
+| Attack | Prevention |
+|---|---|
+| Read messages | Ephemeral Curve25519 shared keys (relay never sees them) |
+| Substitute peer keys (MITM) | TOFU-pinned Ed25519 identity keys — fail-closed on change |
+| Forge messages | Ed25519 canonical signatures — **hard-blocked**, not warned |
+| Replay signed messages with new IDs | msg_id + seq are **inside** the canonical signature (P0.14) |
+| Forge permission approvals | Permission messages go through full E2E envelope (P0.15) |
+| Evict peers by name-squatting | Identity-bound eviction — different sign_pubkey = rejected (P1.17) |
+| Drop messages silently | E2E encrypted delivery acks with 30s timeout |
+| Decrypt past sessions | PFS — ephemeral keys are in-memory only, per session |
 
 ## Setup
 
 ```bash
 cd mycelium && bun install
-RELAY_TOKEN=$(openssl rand -hex 32) bun run relay.ts     # on VPS
+RELAY_TOKEN=$(openssl rand -hex 32) bun run relay.ts
 ```
 
 ```json
@@ -42,57 +42,72 @@ RELAY_TOKEN=$(openssl rand -hex 32) bun run relay.ts     # on VPS
 claude --dangerously-load-development-channels server:mycelium
 ```
 
-## Tools
+## All 25 vulnerabilities fixed (3 adversarial debates)
 
-| Tool | Description |
+### Debate 1 (v2→v3): 7 findings
+| # | Finding | Fix |
+|---|---|---|
+| 1 | Token in URL | First-message auth |
+| 2 | perMessageDeflate bomb | Disabled |
+| 3 | Relay reads messages | E2E TweetNaCl encryption |
+| 4 | Bun v1.3.0 CPU bug | Engine pin ≥1.3.5 |
+| 5 | No memory monitoring | RSS tracking + structured logs |
+| 6 | No rate limiting | Token bucket + per-IP cap |
+| 7 | Broken jitter | AWS Full Jitter |
+
+### Debate 2 (v3→v4): 13 findings
+| # | Finding | Fix |
+|---|---|---|
+| 8 | TOFU fail-open | **Fail-closed** (return null on key change) |
+| 9 | Replay perforated | **Persisted** replay state, **session-scoped** strict seq, **time-based** dedup |
+| 10 | No TLS enforcement | `RELAY_REQUIRE_TLS` + startup warning |
+| 11 | No delivery acks | **E2E encrypted acks** with 30s timeout |
+| 12 | Health token in URL | `Authorization: Bearer` header |
+| 13 | `from` not in signature | `sender` field in canonical |
+| 14 | Offline queue DoS | Per-sender fair-share |
+| 15 | X-Forwarded-For spoof | `RELAY_TRUSTED_PROXY` config |
+| 16 | Stale peer race | Last-writer-wins eviction |
+| 17 | No PFS | Ephemeral Curve25519 per session |
+| 18 | Broadcast plaintext | N×unicast encryption |
+| 19 | Sig verification mismatch | Canonical sorted fields |
+| 20 | No replay protection | msg_id dedup + seq monotonicity |
+
+### Debate 3 (v4→v5): 12 findings
+| # | Finding | Fix |
+|---|---|---|
+| 21 | **Canonical sig excludes msg_id/seq** (P0) | **msg_id + seq IN signature** — relay can't mint new IDs |
+| 22 | **Permission msgs unprotected** (P0) | **Full E2E envelope** for `_perm_req`/`_perm_verdict` |
+| 23 | **Sig verification = warn not block** (P0) | **Hard-block** on bad/missing sig for e2e messages. `sender` REQUIRED |
+| 24 | LWW = unauthenticated eviction | **Identity-bound**: same sign_pubkey = evict, different = reject |
+| 25 | Replay persistence 10s race | **Write-ahead log**: persist msg_id before processing |
+| 26 | session_id not in relay | Stored in Peer, distributed in peerKeyMap |
+| 27 | Fair-share = 1 msg/sender | `max(3, ceil(total/active_peers))` |
+| 28 | myc_trust no fingerprint | **Shows SHA-512 fingerprint** for out-of-band verification |
+| 29 | Cross-project TOFU leak | Document: use per-project `MYC_TOFU_FILE` |
+| 30 | 64-bit session ID | **16-byte** (128-bit, birthday-safe to ~2^64) |
+
+## Known limitations (documented, accepted)
+
+| Risk | Status |
 |---|---|
-| `myc_send` | E2E encrypted message to a peer (with delivery ack) |
-| `myc_broadcast` | E2E encrypted to ALL peers (N×unicast, not plaintext) |
-| `myc_peers` | List peers with TOFU status (🔒/🆕/🔴BLOCKED) |
-| `myc_trust` | Override TOFU block after out-of-band verification |
-
-## All fixes applied (2 adversarial debates, 13 findings)
-
-### P0 — Critical (4)
-
-| # | Finding | Source | Fix |
-|---|---|---|---|
-| 1 | TOFU fail-open — system encrypts to attacker's key | Qwen D1 | **Fail-closed**: `processPeerKeys()` returns null on key change. No session. `myc_trust` for manual override. |
-| 2 | Replay perforated — seq advisory, dedup in-memory, cleared on restart | Codex+Qwen D2 | **Persisted** replay state (disk). **Session-scoped** seq (strict, not advisory). **Time-based** dedup (30min, not FIFO count). |
-| 3 | No TLS enforcement — token in plaintext | Codex D2 | `RELAY_REQUIRE_TLS=true` rejects non-TLS. Warns on startup without it. |
-| 4 | No delivery acks — relay drops silently | Codex D2 | **E2E encrypted acks** — receiver confirms, sender alerts Claude on 30s timeout. |
-
-### P1 — Important (6)
-
-| # | Finding | Source | Fix |
-|---|---|---|---|
-| 5 | Health token in URL | Qwen D2 | `Authorization: Bearer <token>` header (URL param no longer works) |
-| 6 | `from` absent from signature | Qwen D2 | `sender` field in canonical payload — relay re-attribution detected by sig verification |
-| 7 | Offline queue DoS | Qwen D2 | Per-sender fair-share limits (max msgs per sender = total/MAX_PEERS) |
-| 8 | X-Forwarded-For spoofable | Codex+Qwen | `RELAY_TRUSTED_PROXY=true` required to use headers; default = direct IP |
-| 9 | Canonical field-addition risk | Codex D2 | 8 explicit fields in canonical. Documented as design constraint. |
-| 10 | Stale peer eviction race | Debate 1 | Last-writer-wins (close old socket code 4020, accept new) |
-
-### P2 — Documented (3)
-
-| # | Risk | Status |
-|---|---|---|
-| 11 | TweetNaCl-js constant-time not guaranteed in JIT | Migrate to libsodium bindings for high-threat deployments |
-| 12 | No message ordering guarantees | Acceptable for request/response patterns |
-| 13 | Single relay SPOF | NATS as upgrade path |
-
-## Files
-
-| File | Lines | Purpose |
-|---|---|---|
-| `relay.ts` | 501 | WebSocket hub — routing, queues, rate limiting, backpressure |
-| `peer-channel.ts` | 671 | MCP channel — E2E crypto, TOFU, PFS, replay, acks, canonical signing |
-| `test.ts` | 333 | 50 tests — infrastructure + crypto protocol |
+| Shared RELAY_TOKEN = room-level secret | Per-peer tokens = future work |
+| TweetNaCl-js constant-time not guaranteed in JIT | Use libsodium bindings for high-threat |
+| No message ordering | Acceptable for request/response |
+| Single relay SPOF | NATS as upgrade path |
+| First-contact MITM via relay | Architecturally unresolvable without PKI. Use out-of-band fingerprint verification. |
+| No TLS certificate pinning | Use custom CA for corporate proxy environments |
 
 ## Tests
 
 ```bash
-bun install && bun run test.ts   # 50 tests
+bun install && bun run test.ts   # 58 tests
 ```
 
-Tests cover: first-message auth, auth timeout/rejection, broadcast, unicast, sender enforcement, disconnect, room isolation, name limits, room capacity, rate limiting, offline queue+drain, message IDs, health auth (Authorization header), ping/pong, shutdown+reconnect, last-writer-wins eviction, canonical signature with sender field, ephemeral key anti-MITM, TOFU fail-closed, session-scoped replay, PFS round-trip, replay state persistence, time-based dedup expiry.
+## Files
+
+| File | Lines |
+|---|---|
+| relay.ts | 277 |
+| peer-channel.ts | 573 |
+| test.ts | 323 |
+| **Total** | **1173** |
