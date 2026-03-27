@@ -13,8 +13,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
-import nacl from 'tweetnacl'
-import naclUtil from 'tweetnacl-util'
+import sodium from 'libsodium-wrappers-sumo'
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync } from 'fs'
 import { dirname, resolve } from 'path'
 import { homedir } from 'os'
@@ -49,40 +48,40 @@ function safeWrite(path: string, data: string): void {
 // LONG-TERM KEYS (Ed25519 — identity)
 // ===========================================================================
 
-let ltKeys: { signPublicKey: Uint8Array; signSecretKey: Uint8Array }
+let ltKeys: { signPublicKey: Uint8Array; signPrivateKey: Uint8Array }
 
-function loadOrGenLTKeys(): { signPublicKey: Uint8Array; signSecretKey: Uint8Array } {
+function loadOrGenLTKeys(): { signPublicKey: Uint8Array; signPrivateKey: Uint8Array } {
   try {
     if (existsSync(KEY_FILE)) {
       const s = JSON.parse(readFileSync(KEY_FILE, 'utf8'))
       return {
-        signPublicKey: naclUtil.decodeBase64(s.sign_public),
-        signSecretKey: naclUtil.decodeBase64(s.sign_secret),
+        signPublicKey: sodium.from_base64(s.sign_public),
+        signPrivateKey: sodium.from_base64(s.sign_secret),
       }
     }
   } catch {}
 
-  const kp = nacl.sign.keyPair()
+  const kp = sodium.crypto_sign_keypair()
   safeWrite(KEY_FILE, JSON.stringify({
-    sign_public: naclUtil.encodeBase64(kp.publicKey),
-    sign_secret: naclUtil.encodeBase64(kp.secretKey),
+    sign_public: sodium.to_base64(kp.publicKey),
+    sign_secret: sodium.to_base64(kp.privateKey),
   }, null, 2))
   log(`Generated Ed25519 identity → ${KEY_FILE}`)
-  return { signPublicKey: kp.publicKey, signSecretKey: kp.secretKey }
+  return { signPublicKey: kp.publicKey, signPrivateKey: kp.privateKey }
 }
 
 // ===========================================================================
 // EPHEMERAL KEYS (Curve25519 — PFS, per session)
 // ===========================================================================
 
-let ephKeys: { encPublicKey: Uint8Array; encSecretKey: Uint8Array; pubKeySig: string }
+let ephKeys: { encPublicKey: Uint8Array; encPrivateKey: Uint8Array; pubKeySig: string }
 
-function genEphKeys(): { encPublicKey: Uint8Array; encSecretKey: Uint8Array; pubKeySig: string } {
-  const kp = nacl.box.keyPair()
+function genEphKeys(): { encPublicKey: Uint8Array; encPrivateKey: Uint8Array; pubKeySig: string } {
+  const kp = sodium.crypto_box_keypair()
   return {
     encPublicKey: kp.publicKey,
-    encSecretKey: kp.secretKey,
-    pubKeySig: naclUtil.encodeBase64(nacl.sign.detached(kp.publicKey, ltKeys.signSecretKey)),
+    encPrivateKey: kp.privateKey,
+    pubKeySig: sodium.to_base64(sodium.crypto_sign_detached(kp.publicKey, ltKeys.signPrivateKey)),
   }
 }
 
@@ -133,8 +132,8 @@ function tofuOverride(peer: string, key64: string): void {
 
 // Fingerprint for out-of-band verification
 function fingerprint(key64: string): string {
-  const bytes = naclUtil.decodeBase64(key64)
-  const hash = nacl.hash(bytes) // SHA-512
+  const bytes = sodium.from_base64(key64)
+  const hash = sodium.crypto_hash(bytes) // SHA-512
   // Take first 16 bytes, format as 4-char groups
   return Array.from(hash.slice(0, 16))
     .map(b => b.toString(16).padStart(2, '0'))
@@ -171,10 +170,10 @@ function processPeerKeys(
 ): PeerSession | null {
   if (!signPubKey64 || !ephEncPubKey64 || !ephSig64) return null
   try {
-    const signPubKey = naclUtil.decodeBase64(signPubKey64)
-    const ephEncPubKey = naclUtil.decodeBase64(ephEncPubKey64)
+    const signPubKey = sodium.from_base64(signPubKey64)
+    const ephEncPubKey = sodium.from_base64(ephEncPubKey64)
 
-    if (!nacl.sign.detached.verify(ephEncPubKey, naclUtil.decodeBase64(ephSig64), signPubKey)) {
+    if (!sodium.crypto_sign_verify_detached(sodium.from_base64(ephSig64), ephEncPubKey, signPubKey)) {
       log(`⚠️ SECURITY: Bad eph key sig for ${peerName}`)
       return null
     }
@@ -185,7 +184,7 @@ function processPeerKeys(
       return null // FAIL-CLOSED
     }
 
-    const sharedKey = nacl.box.before(ephEncPubKey, ephKeys.encSecretKey)
+    const sharedKey = sodium.crypto_box_beforenm(ephEncPubKey, ephKeys.encPrivateKey)
     const session: PeerSession = {
       signPubKey, ephEncPubKey, sharedKey,
       tofuStatus: tofu,
@@ -206,21 +205,21 @@ function processPeerKeys(
 function encryptFor(peer: string, plaintext: string): { encrypted: string; nonce: string } | null {
   const s = peerSessions.get(peer)
   if (!s) return null
-  const nonce = nacl.randomBytes(nacl.box.nonceLength)
-  const encrypted = naclUtil.encodeBase64(nacl.box.after(naclUtil.decodeUTF8(plaintext), nonce, s.sharedKey))
-  return { encrypted, nonce: naclUtil.encodeBase64(nonce) }
+  const nonce = sodium.randombytes_buf(sodium.crypto_box_NONCEBYTES)
+  const encrypted = sodium.to_base64(sodium.crypto_box_easy_afternm(sodium.from_string(plaintext), nonce, s.sharedKey))
+  return { encrypted, nonce: sodium.to_base64(nonce) }
 }
 
 function decryptFrom(peer: string, enc64: string, nonce64: string): string | null {
   const s = peerSessions.get(peer)
   if (!s) return null
   try {
-    const decrypted = nacl.box.open.after(
-      naclUtil.decodeBase64(enc64),
-      naclUtil.decodeBase64(nonce64),
+    const decrypted = sodium.crypto_box_open_easy_afternm(
+      sodium.from_base64(enc64),
+      sodium.from_base64(nonce64),
       s.sharedKey,
     )
-    return decrypted ? naclUtil.encodeUTF8(decrypted) : null
+    return decrypted ? sodium.to_string(decrypted) : null
   } catch {
     return null
   }
@@ -245,7 +244,7 @@ function canonicalSign(msg: any): string {
     target: msg.target ?? null,
     type: msg.type ?? null,
   })
-  return naclUtil.encodeBase64(nacl.sign.detached(naclUtil.decodeUTF8(canonical), ltKeys.signSecretKey))
+  return sodium.to_base64(sodium.crypto_sign_detached(sodium.from_string(canonical), ltKeys.signPrivateKey))
 }
 
 function verifySig(peerName: string, msg: any, sig64: string): boolean {
@@ -264,9 +263,9 @@ function verifySig(peerName: string, msg: any, sig64: string): boolean {
       target: msg.target ?? null,
       type: msg.type ?? null,
     })
-    return nacl.sign.detached.verify(
-      naclUtil.decodeUTF8(canonical),
-      naclUtil.decodeBase64(sig64),
+    return sodium.crypto_sign_verify_detached(
+      sodium.from_base64(sig64),
+      sodium.from_string(canonical),
       s.signPubKey,
     )
   } catch {
@@ -448,7 +447,7 @@ function makeMsgId(): string {
 }
 
 function generateSessionId(): string {
-  return nacl.randomBytes(16).reduce((s: string, b: number) => s + b.toString(16).padStart(2, '0'), '')
+  return sodium.randombytes_buf(16).reduce((s: string, b: number) => s + b.toString(16).padStart(2, '0'), '')
 }
 
 // ===========================================================================
@@ -645,8 +644,8 @@ function connectRelay(): void {
   ws.addEventListener('open', () => {
     ws!.send(JSON.stringify({
       type: 'auth', token: TOKEN, peer: PEER, room: ROOM,
-      sign_pubkey: naclUtil.encodeBase64(ltKeys.signPublicKey),
-      eph_enc_pubkey: naclUtil.encodeBase64(ephKeys.encPublicKey),
+      sign_pubkey: sodium.to_base64(ltKeys.signPublicKey),
+      eph_enc_pubkey: sodium.to_base64(ephKeys.encPublicKey),
       eph_enc_pubkey_sig: ephKeys.pubKeySig,
       session_id: sessionId,
     }))
@@ -890,29 +889,33 @@ async function safeNotify(n: any): Promise<void> {
 // BOOT
 // ===========================================================================
 
-ltKeys = loadOrGenLTKeys()
-ephKeys = genEphKeys()
-loadTofu()
-loadReplay()
-loadWAL()
+;(async () => {
+  await sodium.ready
 
-log(`Identity: ${naclUtil.encodeBase64(ltKeys.signPublicKey).slice(0, 16)}...`)
-log(`Fingerprint: ${fingerprint(naclUtil.encodeBase64(ltKeys.signPublicKey))}`)
-log(`TOFU: ${Object.keys(tofuStore).length} known | Replay: ${seenMsgIds.size} seen`)
+  ltKeys = loadOrGenLTKeys()
+  ephKeys = genEphKeys()
+  loadTofu()
+  loadReplay()
+  loadWAL()
 
-await mcp.connect(new StdioServerTransport())
-mcpReady = true
-connectRelay()
+  log(`Identity: ${sodium.to_base64(ltKeys.signPublicKey).slice(0, 16)}...`)
+  log(`Fingerprint: ${fingerprint(sodium.to_base64(ltKeys.signPublicKey))}`)
+  log(`TOFU: ${Object.keys(tofuStore).length} known | Replay: ${seenMsgIds.size} seen`)
 
-function cleanup(): void {
-  saveReplay()
-  clearInterval(replayTimer)
-  if (reconnectTimer) clearTimeout(reconnectTimer)
-  stopHB()
-  for (const [, p] of pendingAcks) clearTimeout(p.timer)
-  if (ws) try { ws.close(1000) } catch {}
-  process.exit(0)
-}
+  await mcp.connect(new StdioServerTransport())
+  mcpReady = true
+  connectRelay()
 
-process.on('SIGTERM', cleanup)
-process.on('SIGINT', cleanup)
+  function cleanup(): void {
+    saveReplay()
+    clearInterval(replayTimer)
+    if (reconnectTimer) clearTimeout(reconnectTimer)
+    stopHB()
+    for (const [, p] of pendingAcks) clearTimeout(p.timer)
+    if (ws) try { ws.close(1000) } catch {}
+    process.exit(0)
+  }
+
+  process.on('SIGTERM', cleanup)
+  process.on('SIGINT', cleanup)
+})()

@@ -11,8 +11,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.0",
-    "tweetnacl": "^1.0.3",
-    "tweetnacl-util": "^0.15.1",
+    "libsodium-wrappers-sumo": "^0.8.2",
     "zod": "^3.23.0"
   }
 }

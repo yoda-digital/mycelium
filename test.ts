@@ -2,8 +2,8 @@
 /**
  * Mycelium test suite — infrastructure + crypto protocol.
  */
-import nacl from 'tweetnacl'
-import naclUtil from 'tweetnacl-util'
+import sodium from 'libsodium-wrappers-sumo'
+await sodium.ready
 
 const TOKEN = 'test-' + Date.now()
 const PORT = 9901
@@ -16,15 +16,15 @@ function assert(cond: boolean, name: string): void {
 }
 
 function makeAuth(name: string, room = 'default') {
-  const signKP = nacl.sign.keyPair()
-  const ephKP = nacl.box.keyPair()
-  const ephSig = nacl.sign.detached(ephKP.publicKey, signKP.secretKey)
-  const sid = nacl.randomBytes(16).reduce((s: string, b: number) => s + b.toString(16).padStart(2, '0'), '')
+  const signKP = sodium.crypto_sign_keypair()
+  const ephKP = sodium.crypto_box_keypair()
+  const ephSig = sodium.crypto_sign_detached(ephKP.publicKey, signKP.privateKey)
+  const sid = sodium.randombytes_buf(16).reduce((s: string, b: number) => s + b.toString(16).padStart(2, '0'), '')
   return {
     type: 'auth', token: TOKEN, peer: name, room,
-    sign_pubkey: naclUtil.encodeBase64(signKP.publicKey),
-    eph_enc_pubkey: naclUtil.encodeBase64(ephKP.publicKey),
-    eph_enc_pubkey_sig: naclUtil.encodeBase64(ephSig),
+    sign_pubkey: sodium.to_base64(signKP.publicKey),
+    eph_enc_pubkey: sodium.to_base64(ephKP.publicKey),
+    eph_enc_pubkey_sig: sodium.to_base64(ephSig),
     session_id: sid, _signKP: signKP, _ephKP: ephKP,
   }
 }
@@ -303,13 +303,13 @@ try {
 
   console.log('\n🔏 T15: Canonical sig includes msg_id + seq')
   {
-    const kp = nacl.sign.keyPair()
+    const kp = sodium.crypto_sign_keypair()
     const body = {
       e2e: true, encrypted: 'abc', msg_id: 'id-1', nonce: 'xyz',
       payload: null, sender: 'alice', seq: 7, session_id: 's1', target: 'bob', type: 'info',
     }
     const canonical = JSON.stringify(body) // already sorted by key in object literal above
-    const sig = nacl.sign.detached(naclUtil.decodeUTF8(canonical), kp.secretKey)
+    const sig = sodium.crypto_sign_detached(sodium.from_string(canonical), kp.privateKey)
 
     // Relay tries to replay with new msg_id and seq
     const tampered = { ...body, msg_id: 'id-99', seq: 99 }
@@ -320,19 +320,19 @@ try {
       seq: tampered.seq, session_id: tampered.session_id,
       target: tampered.target, type: tampered.type,
     })
-    assert(!nacl.sign.detached.verify(naclUtil.decodeUTF8(tampCanon), sig, kp.publicKey), 'relay replay with new IDs FAILS sig')
+    assert(!sodium.crypto_sign_verify_detached(sig, sodium.from_string(tampCanon), kp.publicKey), 'relay replay with new IDs FAILS sig')
 
     // Original passes
-    assert(nacl.sign.detached.verify(naclUtil.decodeUTF8(canonical), sig, kp.publicKey), 'original sig valid')
+    assert(sodium.crypto_sign_verify_detached(sig, sodium.from_string(canonical), kp.publicKey), 'original sig valid')
   }
 
   console.log('\n🔑 T16: Ephemeral key anti-MITM')
   {
-    const lt = nacl.sign.keyPair()
-    const eph = nacl.box.keyPair()
-    const sig = nacl.sign.detached(eph.publicKey, lt.secretKey)
-    assert(nacl.sign.detached.verify(eph.publicKey, sig, lt.publicKey), 'eph sig valid')
-    assert(!nacl.sign.detached.verify(nacl.box.keyPair().publicKey, sig, lt.publicKey), 'fake eph rejected')
+    const lt = sodium.crypto_sign_keypair()
+    const eph = sodium.crypto_box_keypair()
+    const sig = sodium.crypto_sign_detached(eph.publicKey, lt.privateKey)
+    assert(sodium.crypto_sign_verify_detached(sig, eph.publicKey, lt.publicKey), 'eph sig valid')
+    assert(!sodium.crypto_sign_verify_detached(sig, sodium.crypto_box_keypair().publicKey, lt.publicKey), 'fake eph rejected')
   }
 
   console.log('\n📌 T17: TOFU fail-closed')
@@ -342,10 +342,10 @@ try {
       if (!store[p]) { store[p] = k; return 'new' }
       return store[p] === k ? 'trusted' : 'changed'
     }
-    const k1 = naclUtil.encodeBase64(nacl.sign.keyPair().publicKey)
+    const k1 = sodium.to_base64(sodium.crypto_sign_keypair().publicKey)
     assert(check('a', k1) === 'new', 'new')
     assert(check('a', k1) === 'trusted', 'trusted')
-    assert(check('a', naclUtil.encodeBase64(nacl.sign.keyPair().publicKey)) === 'changed', 'changed → BLOCKED')
+    assert(check('a', sodium.to_base64(sodium.crypto_sign_keypair().publicKey)) === 'changed', 'changed → BLOCKED')
   }
 
   console.log('\n🔁 T18: Replay — session-scoped strict seq')
@@ -368,14 +368,14 @@ try {
 
   console.log('\n🔐 T19: PFS round-trip')
   {
-    const aE = nacl.box.keyPair()
-    const bE = nacl.box.keyPair()
-    const sAB = nacl.box.before(bE.publicKey, aE.secretKey)
-    const sBA = nacl.box.before(aE.publicKey, bE.secretKey)
-    const n = nacl.randomBytes(nacl.box.nonceLength)
-    const enc = nacl.box.after(naclUtil.decodeUTF8('pfs'), n, sAB)
-    const dec = nacl.box.open.after(enc, n, sBA)
-    assert(!!dec && naclUtil.encodeUTF8(dec) === 'pfs', 'PFS works')
+    const aE = sodium.crypto_box_keypair()
+    const bE = sodium.crypto_box_keypair()
+    const sAB = sodium.crypto_box_beforenm(bE.publicKey, aE.privateKey)
+    const sBA = sodium.crypto_box_beforenm(aE.publicKey, bE.privateKey)
+    const n = sodium.randombytes_buf(sodium.crypto_box_NONCEBYTES)
+    const enc = sodium.crypto_box_easy_afternm(sodium.from_string('pfs'), n, sAB)
+    const dec = sodium.crypto_box_open_easy_afternm(enc, n, sBA)
+    assert(!!dec && sodium.to_string(dec) === 'pfs', 'PFS works')
   }
 
   console.log('\n⏱️ T20: Time-based dedup (not FIFO)')
@@ -400,9 +400,9 @@ try {
 
   console.log('\n🔑 T22: Fingerprint generation')
   {
-    const k = naclUtil.encodeBase64(nacl.sign.keyPair().publicKey)
-    const bytes = naclUtil.decodeBase64(k)
-    const hash = nacl.hash(bytes)
+    const k = sodium.to_base64(sodium.crypto_sign_keypair().publicKey)
+    const bytes = sodium.from_base64(k)
+    const hash = sodium.crypto_hash(bytes)
     const fp = Array.from(hash.slice(0, 16))
       .map(b => b.toString(16).padStart(2, '0'))
       .join('')
@@ -444,7 +444,7 @@ try {
 
   console.log('\n🔢 T25: 16-byte session ID')
   {
-    const sid = nacl.randomBytes(16).reduce((s: string, b: number) => s + b.toString(16).padStart(2, '0'), '')
+    const sid = sodium.randombytes_buf(16).reduce((s: string, b: number) => s + b.toString(16).padStart(2, '0'), '')
     assert(sid.length === 32, '16 bytes = 32 hex chars')
   }
 
@@ -463,14 +463,14 @@ try {
 
   console.log('\n🔏 T27: Canonical sig — relay can\'t replay signed msg with new IDs (integration)')
   {
-    const signKP = nacl.sign.keyPair()
+    const signKP = sodium.crypto_sign_keypair()
     // Sender creates message with specific msg_id and seq
     const origMsg = {
       e2e: true, encrypted: 'data', msg_id: 'orig-1', nonce: 'n1',
       payload: null, sender: 'alice', seq: 0, session_id: 'sess1', target: 'bob', type: 'info',
     }
     const canonical = JSON.stringify(origMsg)
-    const sig = nacl.sign.detached(naclUtil.decodeUTF8(canonical), signKP.secretKey)
+    const sig = sodium.crypto_sign_detached(sodium.from_string(canonical), signKP.privateKey)
 
     // Relay intercepts, changes msg_id to bypass dedup
     const relayMsg = { ...origMsg, msg_id: 'relay-forged-99', seq: 999 }
@@ -483,9 +483,9 @@ try {
     })
 
     // Receiver verifies: MUST FAIL because msg_id and seq are now in canonical
-    assert(!nacl.sign.detached.verify(naclUtil.decodeUTF8(relayCanonical), sig, signKP.publicKey), 'forged msg_id+seq breaks sig ✓')
+    assert(!sodium.crypto_sign_verify_detached(sig, sodium.from_string(relayCanonical), signKP.publicKey), 'forged msg_id+seq breaks sig ✓')
     // Original still valid
-    assert(nacl.sign.detached.verify(naclUtil.decodeUTF8(canonical), sig, signKP.publicKey), 'original sig intact ✓')
+    assert(sodium.crypto_sign_verify_detached(sig, sodium.from_string(canonical), signKP.publicKey), 'original sig intact ✓')
   }
 
   relay.kill('SIGTERM')
