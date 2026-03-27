@@ -2,15 +2,26 @@
 /**
  * Mycelium Relay
  *
- * Dumb router. Stores sign_pubkey for identity-binding but does NOT verify
- * signatures — all crypto enforcement is in peer-channel.ts.
+ * Challenge-response authenticated router with Ed25519 relay identity.
+ * Stores sign_pubkey for identity-binding. Peers verify relay identity
+ * and sign the challenge. New peers need a token; known peers don't.
+ * Token can be sealed (encrypted to relay's public key).
  *
  * Auth flow:
  *   1. Client connects ws(s)://host:port
- *   2. Sends { type:"auth", token, peer, room, sign_pubkey, eph_enc_pubkey, eph_enc_pubkey_sig, session_id }
- *   3. Relay validates → { type:"auth_ok", peers:{...} } with all peer keys + session_ids
- *   4. Identity-bound: same sign_pubkey = evict old (reconnect), different = reject.
+ *   2. Relay sends { type:"challenge", nonce, relay_pubkey, relay_sig, timestamp }
+ *   3. Client signs challenge + sends auth with challenge_sig (+ token or sealed_token for new peers)
+ *   4. Relay validates → { type:"auth_ok", peers:{...} } with all peer keys + session_ids
+ *   5. Identity-bound: same sign_pubkey = evict old (reconnect), different = reject.
  */
+
+import sodium from 'libsodium-wrappers-sumo'
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs'
+import { dirname, resolve } from 'path'
+import { homedir } from 'os'
+
+const toB64 = (x: Uint8Array) => sodium.to_base64(x, sodium.base64_variants.ORIGINAL)
+const fromB64 = (x: string) => sodium.from_base64(x, sodium.base64_variants.ORIGINAL)
 
 const PORT = Number(process.env.RELAY_PORT ?? 9900)
 const TOKEN = process.env.RELAY_TOKEN
@@ -25,6 +36,9 @@ const MAX_IP_CONNS = Number(process.env.RELAY_MAX_IP_CONNS ?? 10)
 const AUTH_TIMEOUT_MS = Number(process.env.RELAY_AUTH_TIMEOUT_MS ?? 5000)
 const REQUIRE_TLS = process.env.RELAY_REQUIRE_TLS === 'true'
 const TRUSTED_PROXY = process.env.RELAY_TRUSTED_PROXY === 'true'
+const RELAY_KEY_FILE = process.env.RELAY_KEY_FILE ?? resolve(homedir(), '.mycelium-relay-keys.json')
+const RELAY_ALLOW_FILE = process.env.RELAY_ALLOW_FILE ?? resolve(homedir(), '.mycelium-relay-allow.json')
+const REQUIRE_CHALLENGE = process.env.RELAY_REQUIRE_CHALLENGE === 'true'
 
 if (!TOKEN) {
   console.error('RELAY_TOKEN required')
@@ -58,6 +72,7 @@ interface WsData {
   ip: string
   name: string
   room: string
+  challengeNonce: Uint8Array | null
 }
 
 const rooms = new Map<string, Map<string, Peer>>()
@@ -234,6 +249,87 @@ const memTimer = setInterval(() => {
 
 if (!REQUIRE_TLS) log('warn', 'tls_not_enforced', { hint: 'Set RELAY_REQUIRE_TLS=true behind TLS proxy' })
 
+// ===========================================================================
+// RELAY IDENTITY + ALLOW LIST
+// ===========================================================================
+
+let relayKeys: { publicKey: Uint8Array; privateKey: Uint8Array }
+
+function loadOrGenRelayKeys(): { publicKey: Uint8Array; privateKey: Uint8Array } {
+  try {
+    if (existsSync(RELAY_KEY_FILE)) {
+      const s = JSON.parse(readFileSync(RELAY_KEY_FILE, 'utf8'))
+      return { publicKey: fromB64(s.public), privateKey: fromB64(s.private) }
+    }
+  } catch {}
+  const kp = sodium.crypto_sign_keypair()
+  try {
+    mkdirSync(dirname(RELAY_KEY_FILE), { recursive: true })
+    writeFileSync(RELAY_KEY_FILE, JSON.stringify({
+      public: toB64(kp.publicKey), private: toB64(kp.privateKey),
+    }, null, 2), { mode: 0o600 })
+  } catch (e) { log('warn', 'key_write_failed', { error: String(e) }) }
+  return kp
+}
+
+let allowList: Record<string, string[]> = {}
+
+function loadAllowList(): void {
+  try { if (existsSync(RELAY_ALLOW_FILE)) allowList = JSON.parse(readFileSync(RELAY_ALLOW_FILE, 'utf8')) } catch {}
+}
+
+function saveAllowList(): void {
+  try {
+    mkdirSync(dirname(RELAY_ALLOW_FILE), { recursive: true })
+    writeFileSync(RELAY_ALLOW_FILE, JSON.stringify(allowList, null, 2), { mode: 0o600 })
+  } catch {}
+}
+
+function isAllowed(room: string, pubkey: string): boolean {
+  return allowList[room]?.includes(pubkey) ?? false
+}
+
+function addToAllowList(room: string, pubkey: string): void {
+  if (!allowList[room]) allowList[room] = []
+  if (!allowList[room].includes(pubkey)) {
+    allowList[room].push(pubkey)
+    saveAllowList()
+  }
+}
+
+function relayFingerprint(key: Uint8Array): string {
+  const hash = sodium.crypto_hash(key)
+  return Array.from(hash.slice(0, 16))
+    .map((b: number) => b.toString(16).padStart(2, '0'))
+    .join('')
+    .match(/.{4}/g)!
+    .join(':')
+}
+
+function broadcast(room: string, sender: string, msg: any): void {
+  const data = JSON.stringify(msg)
+  for (const [n, p] of getPeersInRoom(room)) {
+    if (n === sender) continue
+    try {
+      const r = p.ws.send(data)
+      if (r === 0) log('warn', 'backpressure_drop', { peer: n })
+    } catch {
+      log('warn', 'send_fail_reap', { peer: n })
+      try { p.ws.close(4002, 'send failed') } catch {}
+    }
+  }
+}
+
+// ===========================================================================
+// SERVER (wrapped in async IIFE for sodium.ready)
+// ===========================================================================
+
+;(async () => {
+  await sodium.ready
+  relayKeys = loadOrGenRelayKeys()
+  loadAllowList()
+  log('info', 'relay_identity', { fingerprint: relayFingerprint(relayKeys.publicKey) })
+
 const server = Bun.serve({
   port: PORT,
   fetch(req, server) {
@@ -265,7 +361,7 @@ const server = Bun.serve({
     }
 
     const ok = server.upgrade(req, {
-      data: { authenticated: false, authTimer: null, ip, name: '', room: '' } satisfies WsData,
+      data: { authenticated: false, authTimer: null, ip, name: '', room: '', challengeNonce: null } satisfies WsData,
     })
     return ok ? undefined : new Response('upgrade failed', { status: 500 })
   },
@@ -281,6 +377,19 @@ const server = Bun.serve({
     open(ws: any) {
       const d = ws.data as WsData
       incrIp(d.ip)
+
+      const nonce = sodium.randombytes_buf(32)
+      d.challengeNonce = nonce
+      const ts = Date.now().toString()
+      const sigData = new Uint8Array([...nonce, ...sodium.from_string(ts)])
+      ws.send(JSON.stringify({
+        type: 'challenge',
+        nonce: toB64(nonce),
+        relay_pubkey: toB64(relayKeys.publicKey),
+        relay_sig: toB64(sodium.crypto_sign_detached(sigData, relayKeys.privateKey)),
+        timestamp: ts,
+      }))
+
       d.authTimer = setTimeout(() => {
         log('warn', 'auth_timeout', { ip: d.ip })
         try { ws.close(4003, 'auth timeout') } catch {}
@@ -319,11 +428,6 @@ const server = Bun.serve({
           ws.close(4004, 'auth required')
           return
         }
-        if (msg.token !== TOKEN) {
-          ws.send(JSON.stringify({ type: 'auth_error', from: '_relay', payload: 'invalid token' }))
-          ws.close(4005, 'bad token')
-          return
-        }
         if (!msg.peer || typeof msg.peer !== 'string' || msg.peer.length > 64) {
           ws.send(JSON.stringify({ type: 'auth_error', from: '_relay', payload: 'invalid peer name' }))
           ws.close(4006, 'bad name')
@@ -336,6 +440,63 @@ const server = Bun.serve({
         }
 
         const room = msg.room ?? process.env.RELAY_ROOM ?? 'default'
+        const known = isAllowed(room, msg.sign_pubkey)
+
+        if (msg.challenge_sig && d.challengeNonce) {
+          // Verify challenge signature
+          try {
+            const sigData = new Uint8Array([
+              ...d.challengeNonce,
+              ...sodium.from_string(msg.peer),
+              ...sodium.from_string(room),
+            ])
+            const sigValid = sodium.crypto_sign_verify_detached(
+              fromB64(msg.challenge_sig), sigData, fromB64(msg.sign_pubkey),
+            )
+            if (!sigValid) throw new Error('bad sig')
+          } catch {
+            ws.send(JSON.stringify({ type: 'auth_error', from: '_relay', payload: 'bad challenge signature' }))
+            ws.close(4005, 'bad challenge sig')
+            return
+          }
+
+          if (!known) {
+            // New peer: require token (plaintext or sealed)
+            let tokenValid = false
+            if (msg.sealed_token) {
+              try {
+                const curvePk = sodium.crypto_sign_ed25519_pk_to_curve25519(relayKeys.publicKey)
+                const curveSk = sodium.crypto_sign_ed25519_sk_to_curve25519(relayKeys.privateKey)
+                const decrypted = sodium.crypto_box_seal_open(fromB64(msg.sealed_token), curvePk, curveSk)
+                tokenValid = sodium.to_string(decrypted) === TOKEN
+              } catch {}
+            } else if (msg.token) {
+              tokenValid = msg.token === TOKEN
+            }
+
+            if (!tokenValid) {
+              ws.send(JSON.stringify({ type: 'auth_error', from: '_relay', payload: 'invalid token' }))
+              ws.close(4005, 'bad token')
+              return
+            }
+            addToAllowList(room, msg.sign_pubkey)
+            log('info', 'peer_registered', { peer: msg.peer, room })
+          }
+        } else {
+          // No challenge sig: fallback to token-only
+          if (REQUIRE_CHALLENGE) {
+            ws.send(JSON.stringify({ type: 'auth_error', from: '_relay', payload: 'challenge_sig required' }))
+            ws.close(4005, 'challenge required')
+            return
+          }
+          if (msg.token !== TOKEN) {
+            ws.send(JSON.stringify({ type: 'auth_error', from: '_relay', payload: 'invalid token' }))
+            ws.close(4005, 'bad token')
+            return
+          }
+          if (!known) addToAllowList(room, msg.sign_pubkey)
+        }
+
         const rp = getPeersInRoom(room)
 
         // Identity-bound eviction
@@ -447,20 +608,6 @@ const server = Bun.serve({
   },
 })
 
-function broadcast(room: string, sender: string, msg: any): void {
-  const data = JSON.stringify(msg)
-  for (const [n, p] of getPeersInRoom(room)) {
-    if (n === sender) continue
-    try {
-      const r = p.ws.send(data)
-      if (r === 0) log('warn', 'backpressure_drop', { peer: n })
-    } catch {
-      log('warn', 'send_fail_reap', { peer: n })
-      try { p.ws.close(4002, 'send failed') } catch {}
-    }
-  }
-}
-
 function shutdown(sig: string): void {
   if (shuttingDown) return
   shuttingDown = true
@@ -496,3 +643,5 @@ process.on('SIGTERM', () => shutdown('SIGTERM'))
 process.on('SIGINT', () => shutdown('SIGINT'))
 
 log('info', 'relay_started', { port: PORT, max_peers: MAX_PEERS, rate_limit: RATE_LIMIT, queue_ttl_s: QUEUE_TTL_S, require_tls: REQUIRE_TLS })
+
+})() // end async IIFE

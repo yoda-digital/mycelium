@@ -29,6 +29,7 @@ const ROOM = process.env.MYC_ROOM ?? 'default'
 const KEY_FILE = process.env.MYC_KEY_FILE ?? resolve(homedir(), '.mycelium-keys.json')
 const TOFU_FILE = process.env.MYC_TOFU_FILE ?? resolve(homedir(), '.mycelium-known-peers.json')
 const REPLAY_FILE = process.env.MYC_REPLAY_FILE ?? resolve(homedir(), '.mycelium-replay-state.json')
+const RELAY_FINGERPRINT = process.env.MYC_RELAY_FINGERPRINT
 
 if (!RELAY_LIST.length || !TOKEN || !PEER) {
   console.error('Required: MYC_RELAY, MYC_TOKEN, MYC_PEER')
@@ -761,13 +762,7 @@ function connectRelay(): void {
   }
 
   ws.addEventListener('open', () => {
-    ws!.send(JSON.stringify({
-      type: 'auth', token: TOKEN, peer: PEER, room: ROOM,
-      sign_pubkey: toB64(ltKeys.signPublicKey),
-      eph_enc_pubkey: toB64(ephKeys.encPublicKey),
-      eph_enc_pubkey_sig: ephKeys.pubKeySig,
-      session_id: sessionId,
-    }))
+    log('Connected, awaiting challenge...')
   })
 
   ws.addEventListener('message', async (event) => {
@@ -776,6 +771,69 @@ function connectRelay(): void {
     try {
       msg = JSON.parse(typeof event.data === 'string' ? event.data : event.data.toString())
     } catch {
+      return
+    }
+
+    if (msg.type === 'challenge') {
+      // L6: Verify relay identity if fingerprint configured
+      if (RELAY_FINGERPRINT && msg.relay_pubkey) {
+        try {
+          const rpk = fromB64(msg.relay_pubkey)
+          const fp = fingerprint(msg.relay_pubkey)
+          if (fp !== RELAY_FINGERPRINT) {
+            log(`RELAY IDENTITY MISMATCH: expected ${RELAY_FINGERPRINT}, got ${fp}`)
+            ws!.close(4099, 'relay identity mismatch')
+            return
+          }
+          if (msg.relay_sig && msg.timestamp) {
+            const nonce = fromB64(msg.nonce)
+            const sigData = new Uint8Array([...nonce, ...sodium.from_string(msg.timestamp)])
+            if (!sodium.crypto_sign_verify_detached(fromB64(msg.relay_sig), sigData, rpk)) {
+              log(`RELAY SIG INVALID`)
+              ws!.close(4099, 'relay sig invalid')
+              return
+            }
+          }
+          log(`Relay identity verified: ${fp}`)
+        } catch (e) {
+          log(`Relay identity check error: ${e}`)
+          ws!.close(4099, 'relay identity error')
+          return
+        }
+      }
+
+      // L1: Sign challenge
+      const nonce = fromB64(msg.nonce)
+      const sigData = new Uint8Array([
+        ...nonce,
+        ...sodium.from_string(PEER!),
+        ...sodium.from_string(ROOM),
+      ])
+      const challengeSig = toB64(sodium.crypto_sign_detached(sigData, ltKeys.signPrivateKey))
+
+      // Build auth message
+      const authMsg: any = {
+        type: 'auth', peer: PEER, room: ROOM,
+        sign_pubkey: toB64(ltKeys.signPublicKey),
+        eph_enc_pubkey: toB64(ephKeys.encPublicKey),
+        eph_enc_pubkey_sig: ephKeys.pubKeySig,
+        session_id: sessionId,
+        challenge_sig: challengeSig,
+      }
+
+      // L6: Seal token if relay pubkey available
+      if (msg.relay_pubkey) {
+        try {
+          const relayCurvePk = sodium.crypto_sign_ed25519_pk_to_curve25519(fromB64(msg.relay_pubkey))
+          authMsg.sealed_token = toB64(sodium.crypto_box_seal(sodium.from_string(TOKEN!), relayCurvePk))
+        } catch {
+          authMsg.token = TOKEN
+        }
+      } else {
+        authMsg.token = TOKEN
+      }
+
+      ws!.send(JSON.stringify(authMsg))
       return
     }
 

@@ -45,10 +45,24 @@ async function connectPeer(
     const auth = opts?.authOverride ?? makeAuth(name, room)
     ws.authData = auth
 
-    ws.addEventListener('open', () => ws.send(JSON.stringify(auth)))
-
     const handler = (e: any) => {
       const msg = JSON.parse(typeof e.data === 'string' ? e.data : e.data.toString())
+
+      // Handle challenge (L1)
+      if (msg.type === 'challenge' && !authed) {
+        const nonce = fromB64(msg.nonce)
+        const sigData = new Uint8Array([
+          ...nonce,
+          ...sodium.from_string(name),
+          ...sodium.from_string(room),
+        ])
+        const challengeSig = toB64(
+          sodium.crypto_sign_detached(sigData, auth._signKP.privateKey)
+        )
+        ws.send(JSON.stringify({ ...auth, challenge_sig: challengeSig }))
+        return
+      }
+
       if (!authed) {
         if (msg.type === 'auth_ok') {
           authed = true
@@ -104,6 +118,10 @@ async function consumeN(ws: WebSocket, n: number): Promise<void> {
   }
 }
 
+const testId = Date.now()
+const RELAY_ALLOW_FILE_PATH = `/tmp/myc-test-allow-${testId}.json`
+const RELAY_KEY_FILE_PATH = `/tmp/myc-test-relay-keys-${testId}.json`
+
 let relay = Bun.spawn(['bun', 'run', 'relay.ts'], {
   cwd: import.meta.dir,
   env: {
@@ -118,6 +136,8 @@ let relay = Bun.spawn(['bun', 'run', 'relay.ts'], {
     RELAY_QUEUE_TTL_S: '10',
     RELAY_MAX_IP_CONNS: '30',
     RELAY_AUTH_TIMEOUT_MS: '2000',
+    RELAY_ALLOW_FILE: RELAY_ALLOW_FILE_PATH,
+    RELAY_KEY_FILE: RELAY_KEY_FILE_PATH,
   },
   stdout: 'pipe',
   stderr: 'pipe',
@@ -141,7 +161,13 @@ try {
   try {
     await new Promise<void>((r) => {
       const w = new WebSocket(`ws://127.0.0.1:${PORT}`)
-      w.addEventListener('open', () => w.send(JSON.stringify({ type: 'auth', token: 'bad', peer: 'x', sign_pubkey: 'x' })))
+      w.addEventListener('message', (e) => {
+        const msg = JSON.parse(typeof e.data === 'string' ? e.data : e.data.toString())
+        if (msg.type === 'challenge') {
+          // Send auth with bad token (no challenge_sig, so fallback to token-only)
+          w.send(JSON.stringify({ type: 'auth', token: 'bad', peer: 'x', sign_pubkey: 'x' }))
+        }
+      })
       w.addEventListener('close', () => r())
       setTimeout(r, 2000)
     })
@@ -179,6 +205,7 @@ try {
   assert((await cS).from === 'bob', 'from overwritten')
 
   console.log('\n🚪 T6: Disconnect + Room isolation')
+  await Bun.sleep(200)
   const aL = waitMsg(a)
   c.close()
   assert((await aL).type === 'peer_left', 'left')
@@ -264,6 +291,8 @@ try {
       RELAY_MAX_PEERS: '10',
       RELAY_PING_INTERVAL: '30',
       RELAY_RATE_LIMIT: '300',
+      RELAY_ALLOW_FILE: RELAY_ALLOW_FILE_PATH,
+      RELAY_KEY_FILE: RELAY_KEY_FILE_PATH,
     },
     stdout: 'pipe',
     stderr: 'pipe',
@@ -513,6 +542,35 @@ try {
     assert(relays.length === 1, 'L4: single relay backward compat')
   }
 
+  console.log('\n=== L1+L6: Challenge-response + relay identity ===')
+
+  // T-L1-1: Relay sends challenge on connect
+  {
+    const ws = new WebSocket(`ws://127.0.0.1:${PORT}`)
+    const challengeMsg = await new Promise<any>((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error('no challenge')), 3000)
+      ws.addEventListener('message', (e) => {
+        clearTimeout(t)
+        resolve(JSON.parse(typeof e.data === 'string' ? e.data : e.data.toString()))
+      }, { once: true })
+      ws.addEventListener('error', () => { clearTimeout(t); reject(new Error('ws err')) })
+    })
+    assert(challengeMsg.type === 'challenge', 'L1: relay sends challenge on connect')
+    assert(typeof challengeMsg.nonce === 'string', 'L1: challenge has nonce')
+    assert(typeof challengeMsg.relay_pubkey === 'string', 'L6: challenge has relay_pubkey')
+    assert(typeof challengeMsg.relay_sig === 'string', 'L6: challenge has relay_sig')
+    ws.close()
+    await Bun.sleep(100)
+  }
+
+  // T-L1-2: Peer with valid challenge_sig + token authenticates
+  {
+    const p = await connectPeer('l1-test-a')
+    assert(!!p, 'L1: challenge-response auth succeeds')
+    p.close()
+    await Bun.sleep(100)
+  }
+
   relay.kill('SIGTERM')
   await relay.exited
 
@@ -521,6 +579,9 @@ try {
   failed++
 } finally {
   try { relay.kill() } catch {}
+  // Clean up temp files
+  try { require('fs').unlinkSync(RELAY_ALLOW_FILE_PATH) } catch {}
+  try { require('fs').unlinkSync(RELAY_KEY_FILE_PATH) } catch {}
   console.log(`\n${'='.repeat(50)}`)
   console.log(`Results: ${passed} passed, ${failed} failed`)
   console.log('='.repeat(50))
