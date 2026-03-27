@@ -63,7 +63,11 @@ Then tell Claude Code to load it:
 claude --dangerously-load-development-channels server:mycelium
 ```
 
-Each peer needs a unique `MYC_PEER` name and the same `MYC_TOKEN`. That's it.
+Each peer needs a unique `MYC_PEER` name and the same `MYC_TOKEN`. If running **multiple peers on the same machine**, each must have its own `MYC_KEY_FILE` — otherwise they share one identity keypair and cause TOFU violations:
+
+```json
+"MYC_KEY_FILE": "~/.mycelium-keys-alice.json"
+```
 
 ## Environment variables
 

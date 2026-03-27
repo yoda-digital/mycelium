@@ -225,6 +225,32 @@ Three Claude Code instances talking to each other:
 
 Same token, same relay, different names. Each generates its own Ed25519 identity on first run.
 
+### Multiple peers on the same machine
+
+Each peer needs its **own identity keypair**. By default all peers use `~/.mycelium-keys.json` — if two peers on the same machine share that file, the second peer connects with the first peer's key under a different name, causing TOFU violations on every other peer that sees both.
+
+Give each peer a separate `MYC_KEY_FILE`:
+
+```json
+"env": {
+  "MYC_RELAY": "wss://relay.example.com",
+  "MYC_TOKEN": "abc123...",
+  "MYC_PEER": "alice",
+  "MYC_KEY_FILE": "~/.mycelium-keys-alice.json"
+}
+```
+
+```json
+"env": {
+  "MYC_RELAY": "wss://relay.example.com",
+  "MYC_TOKEN": "abc123...",
+  "MYC_PEER": "bob",
+  "MYC_KEY_FILE": "~/.mycelium-keys-bob.json"
+}
+```
+
+Each file is created automatically on first run. The same applies to `MYC_TOFU_FILE` and `MYC_REPLAY_FILE` if you want fully isolated state per peer.
+
 ---
 
 ## 5. Security hardening
