@@ -785,14 +785,17 @@ function connectRelay(): void {
             ws!.close(4099, 'relay identity mismatch')
             return
           }
-          if (msg.relay_sig && msg.timestamp) {
-            const nonce = fromB64(msg.nonce)
-            const sigData = new Uint8Array([...nonce, ...sodium.from_string(msg.timestamp)])
-            if (!sodium.crypto_sign_verify_detached(fromB64(msg.relay_sig), sigData, rpk)) {
-              log(`RELAY SIG INVALID`)
-              ws!.close(4099, 'relay sig invalid')
-              return
-            }
+          if (!msg.relay_sig || !msg.timestamp) {
+            log(`RELAY SIG MISSING — refusing to authenticate`)
+            ws!.close(4099, 'relay sig missing')
+            return
+          }
+          const nonce = fromB64(msg.nonce)
+          const sigData = new Uint8Array([...nonce, ...sodium.from_string(msg.timestamp)])
+          if (!sodium.crypto_sign_verify_detached(fromB64(msg.relay_sig), sigData, rpk)) {
+            log(`RELAY SIG INVALID`)
+            ws!.close(4099, 'relay sig invalid')
+            return
           }
           log(`Relay identity verified: ${fp}`)
         } catch (e) {
