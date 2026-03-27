@@ -15,6 +15,9 @@ import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprot
 import { z } from 'zod'
 import sodium from 'libsodium-wrappers-sumo'
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync } from 'fs'
+
+const toB64 = (x: Uint8Array) => sodium.to_base64(x, sodium.base64_variants.ORIGINAL)
+const fromB64 = (x: string) => sodium.from_base64(x, sodium.base64_variants.ORIGINAL)
 import { dirname, resolve } from 'path'
 import { homedir } from 'os'
 
@@ -55,16 +58,16 @@ function loadOrGenLTKeys(): { signPublicKey: Uint8Array; signPrivateKey: Uint8Ar
     if (existsSync(KEY_FILE)) {
       const s = JSON.parse(readFileSync(KEY_FILE, 'utf8'))
       return {
-        signPublicKey: sodium.from_base64(s.sign_public),
-        signPrivateKey: sodium.from_base64(s.sign_secret),
+        signPublicKey: fromB64(s.sign_public),
+        signPrivateKey: fromB64(s.sign_secret),
       }
     }
   } catch {}
 
   const kp = sodium.crypto_sign_keypair()
   safeWrite(KEY_FILE, JSON.stringify({
-    sign_public: sodium.to_base64(kp.publicKey),
-    sign_secret: sodium.to_base64(kp.privateKey),
+    sign_public: toB64(kp.publicKey),
+    sign_secret: toB64(kp.privateKey),
   }, null, 2))
   log(`Generated Ed25519 identity → ${KEY_FILE}`)
   return { signPublicKey: kp.publicKey, signPrivateKey: kp.privateKey }
@@ -81,7 +84,7 @@ function genEphKeys(): { encPublicKey: Uint8Array; encPrivateKey: Uint8Array; pu
   return {
     encPublicKey: kp.publicKey,
     encPrivateKey: kp.privateKey,
-    pubKeySig: sodium.to_base64(sodium.crypto_sign_detached(kp.publicKey, ltKeys.signPrivateKey)),
+    pubKeySig: toB64(sodium.crypto_sign_detached(kp.publicKey, ltKeys.signPrivateKey)),
   }
 }
 
@@ -132,7 +135,7 @@ function tofuOverride(peer: string, key64: string): void {
 
 // Fingerprint for out-of-band verification
 function fingerprint(key64: string): string {
-  const bytes = sodium.from_base64(key64)
+  const bytes = fromB64(key64)
   const hash = sodium.crypto_hash(bytes) // SHA-512
   // Take first 16 bytes, format as 4-char groups
   return Array.from(hash.slice(0, 16))
@@ -170,10 +173,10 @@ function processPeerKeys(
 ): PeerSession | null {
   if (!signPubKey64 || !ephEncPubKey64 || !ephSig64) return null
   try {
-    const signPubKey = sodium.from_base64(signPubKey64)
-    const ephEncPubKey = sodium.from_base64(ephEncPubKey64)
+    const signPubKey = fromB64(signPubKey64)
+    const ephEncPubKey = fromB64(ephEncPubKey64)
 
-    if (!sodium.crypto_sign_verify_detached(sodium.from_base64(ephSig64), ephEncPubKey, signPubKey)) {
+    if (!sodium.crypto_sign_verify_detached(fromB64(ephSig64), ephEncPubKey, signPubKey)) {
       log(`⚠️ SECURITY: Bad eph key sig for ${peerName}`)
       return null
     }
@@ -206,8 +209,8 @@ function encryptFor(peer: string, plaintext: string): { encrypted: string; nonce
   const s = peerSessions.get(peer)
   if (!s) return null
   const nonce = sodium.randombytes_buf(sodium.crypto_box_NONCEBYTES)
-  const encrypted = sodium.to_base64(sodium.crypto_box_easy_afternm(sodium.from_string(plaintext), nonce, s.sharedKey))
-  return { encrypted, nonce: sodium.to_base64(nonce) }
+  const encrypted = toB64(sodium.crypto_box_easy_afternm(sodium.from_string(plaintext), nonce, s.sharedKey))
+  return { encrypted, nonce: toB64(nonce) }
 }
 
 function decryptFrom(peer: string, enc64: string, nonce64: string): string | null {
@@ -215,11 +218,11 @@ function decryptFrom(peer: string, enc64: string, nonce64: string): string | nul
   if (!s) return null
   try {
     const decrypted = sodium.crypto_box_open_easy_afternm(
-      sodium.from_base64(enc64),
-      sodium.from_base64(nonce64),
+      fromB64(enc64),
+      fromB64(nonce64),
       s.sharedKey,
     )
-    return decrypted ? sodium.to_string(decrypted) : null
+    return sodium.to_string(decrypted)
   } catch {
     return null
   }
@@ -244,7 +247,7 @@ function canonicalSign(msg: any): string {
     target: msg.target ?? null,
     type: msg.type ?? null,
   })
-  return sodium.to_base64(sodium.crypto_sign_detached(sodium.from_string(canonical), ltKeys.signPrivateKey))
+  return toB64(sodium.crypto_sign_detached(sodium.from_string(canonical), ltKeys.signPrivateKey))
 }
 
 function verifySig(peerName: string, msg: any, sig64: string): boolean {
@@ -264,7 +267,7 @@ function verifySig(peerName: string, msg: any, sig64: string): boolean {
       type: msg.type ?? null,
     })
     return sodium.crypto_sign_verify_detached(
-      sodium.from_base64(sig64),
+      fromB64(sig64),
       sodium.from_string(canonical),
       s.signPubKey,
     )
@@ -644,8 +647,8 @@ function connectRelay(): void {
   ws.addEventListener('open', () => {
     ws!.send(JSON.stringify({
       type: 'auth', token: TOKEN, peer: PEER, room: ROOM,
-      sign_pubkey: sodium.to_base64(ltKeys.signPublicKey),
-      eph_enc_pubkey: sodium.to_base64(ephKeys.encPublicKey),
+      sign_pubkey: toB64(ltKeys.signPublicKey),
+      eph_enc_pubkey: toB64(ephKeys.encPublicKey),
       eph_enc_pubkey_sig: ephKeys.pubKeySig,
       session_id: sessionId,
     }))
@@ -748,7 +751,7 @@ function connectRelay(): void {
       return
     }
 
-    // --- Acks (lightweight, no sig enforcement needed — nacl.box provides auth) ---
+    // --- Acks (lightweight, no sig enforcement needed — authenticated encryption provides auth) ---
     if (msg.type === '_ack') {
       if (msg.e2e && msg.encrypted && msg.nonce) {
         const dec = decryptFrom(msg.from, msg.encrypted, msg.nonce)
@@ -898,8 +901,8 @@ async function safeNotify(n: any): Promise<void> {
   loadReplay()
   loadWAL()
 
-  log(`Identity: ${sodium.to_base64(ltKeys.signPublicKey).slice(0, 16)}...`)
-  log(`Fingerprint: ${fingerprint(sodium.to_base64(ltKeys.signPublicKey))}`)
+  log(`Identity: ${toB64(ltKeys.signPublicKey).slice(0, 16)}...`)
+  log(`Fingerprint: ${fingerprint(toB64(ltKeys.signPublicKey))}`)
   log(`TOFU: ${Object.keys(tofuStore).length} known | Replay: ${seenMsgIds.size} seen`)
 
   await mcp.connect(new StdioServerTransport())

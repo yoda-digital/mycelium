@@ -5,6 +5,9 @@
 import sodium from 'libsodium-wrappers-sumo'
 await sodium.ready
 
+const toB64 = (x: Uint8Array) => sodium.to_base64(x, sodium.base64_variants.ORIGINAL)
+const fromB64 = (x: string) => sodium.from_base64(x, sodium.base64_variants.ORIGINAL)
+
 const TOKEN = 'test-' + Date.now()
 const PORT = 9901
 let passed = 0
@@ -22,9 +25,9 @@ function makeAuth(name: string, room = 'default') {
   const sid = sodium.randombytes_buf(16).reduce((s: string, b: number) => s + b.toString(16).padStart(2, '0'), '')
   return {
     type: 'auth', token: TOKEN, peer: name, room,
-    sign_pubkey: sodium.to_base64(signKP.publicKey),
-    eph_enc_pubkey: sodium.to_base64(ephKP.publicKey),
-    eph_enc_pubkey_sig: sodium.to_base64(ephSig),
+    sign_pubkey: toB64(signKP.publicKey),
+    eph_enc_pubkey: toB64(ephKP.publicKey),
+    eph_enc_pubkey_sig: toB64(ephSig),
     session_id: sid, _signKP: signKP, _ephKP: ephKP,
   }
 }
@@ -342,10 +345,10 @@ try {
       if (!store[p]) { store[p] = k; return 'new' }
       return store[p] === k ? 'trusted' : 'changed'
     }
-    const k1 = sodium.to_base64(sodium.crypto_sign_keypair().publicKey)
+    const k1 = toB64(sodium.crypto_sign_keypair().publicKey)
     assert(check('a', k1) === 'new', 'new')
     assert(check('a', k1) === 'trusted', 'trusted')
-    assert(check('a', sodium.to_base64(sodium.crypto_sign_keypair().publicKey)) === 'changed', 'changed → BLOCKED')
+    assert(check('a', toB64(sodium.crypto_sign_keypair().publicKey)) === 'changed', 'changed → BLOCKED')
   }
 
   console.log('\n🔁 T18: Replay — session-scoped strict seq')
@@ -400,8 +403,8 @@ try {
 
   console.log('\n🔑 T22: Fingerprint generation')
   {
-    const k = sodium.to_base64(sodium.crypto_sign_keypair().publicKey)
-    const bytes = sodium.from_base64(k)
+    const k = toB64(sodium.crypto_sign_keypair().publicKey)
+    const bytes = fromB64(k)
     const hash = sodium.crypto_hash(bytes)
     const fp = Array.from(hash.slice(0, 16))
       .map(b => b.toString(16).padStart(2, '0'))
