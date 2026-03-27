@@ -234,7 +234,7 @@ function decryptFrom(peer: string, enc64: string, nonce64: string): string | nul
 // ===========================================================================
 
 function canonicalSign(msg: any): string {
-  // 10 fields, SORTED, ALL semantically meaningful fields covered.
+  // 11 fields, SORTED, ALL semantically meaningful fields covered.
   // msg_id + seq are IN the canonical — relay can't mint new IDs for signed messages.
   const canonical = JSON.stringify({
     e2e: msg.e2e ?? null,
@@ -242,6 +242,7 @@ function canonicalSign(msg: any): string {
     msg_id: msg.msg_id ?? null,     // signed — prevents relay replay with new IDs
     nonce: msg.nonce ?? null,
     payload: msg.payload ?? null,
+    request_id: msg.request_id ?? null,
     sender: msg.sender ?? null,
     seq: msg.seq ?? null,           // signed — prevents relay seq manipulation
     session_id: msg.session_id ?? null,
@@ -261,6 +262,7 @@ function verifySig(peerName: string, msg: any, sig64: string): boolean {
       msg_id: msg.msg_id ?? null,
       nonce: msg.nonce ?? null,
       payload: msg.payload ?? null,
+      request_id: msg.request_id ?? null,
       sender: msg.sender ?? null,
       seq: msg.seq ?? null,
       session_id: msg.session_id ?? null,
@@ -327,23 +329,22 @@ function checkReplay(
   msgId: string | undefined,
   seq: number | undefined,
   sid: string | undefined,
-): { duplicate: boolean; seqBad: boolean } {
+): { duplicate: boolean } {
   let duplicate = false
-  let seqBad = false
 
   if (msgId) {
     if (seenMsgIds.has(msgId)) duplicate = true
     else writeAheadMsgId(msgId)
   }
 
+  // Track max seq for persistence (ordering handled by reorder buffer)
   if (typeof seq === 'number' && sid) {
     if (!peerSeqs[from]) peerSeqs[from] = {}
     const last = peerSeqs[from][sid] ?? -1
-    if (seq <= last) seqBad = true
-    else peerSeqs[from][sid] = seq
+    if (seq > last) peerSeqs[from][sid] = seq
   }
 
-  return { duplicate, seqBad }
+  return { duplicate }
 }
 
 const replayTimer = setInterval(() => {
@@ -359,6 +360,75 @@ const replayTimer = setInterval(() => {
   // Clear WAL after full save
   try { writeFileSync(REPLAY_FILE + '.wal', '') } catch {}
 }, 10_000)
+
+// ===========================================================================
+// REORDER BUFFER — fixes out-of-order seq being dropped as replay
+// ===========================================================================
+
+interface BufferedMsg {
+  seq: number
+  msg: any
+  receivedAt: number
+}
+
+const reorderBuffers = new Map<string, BufferedMsg[]>()
+const expectedSeqs = new Map<string, number>()
+
+function reorderKey(peer: string, sid: string): string {
+  return `${peer}\0${sid}`
+}
+
+function bufferInsert(peer: string, sid: string, seq: number, msg: any): void {
+  const key = reorderKey(peer, sid)
+  let buf = reorderBuffers.get(key)
+  if (!buf) { buf = []; reorderBuffers.set(key, buf) }
+  buf.push({ seq, msg, receivedAt: Date.now() })
+  buf.sort((a, b) => a.seq - b.seq)
+}
+
+async function bufferFlush(peer: string, sid: string, processFn: (msg: any) => Promise<void>): Promise<void> {
+  const key = reorderKey(peer, sid)
+  const buf = reorderBuffers.get(key)
+  if (!buf || !buf.length) return
+
+  let expected = expectedSeqs.get(key) ?? 0
+
+  while (buf.length && buf[0].seq === expected) {
+    const item = buf.shift()!
+    expected++
+    await processFn(item.msg)
+  }
+
+  while (buf.length > 5) {
+    const item = buf.shift()!
+    expected = item.seq + 1
+    await processFn(item.msg)
+  }
+
+  expectedSeqs.set(key, expected)
+  if (!buf.length) reorderBuffers.delete(key)
+}
+
+function bufferForceFlushPeer(peer: string): void {
+  for (const [key] of reorderBuffers) {
+    if (key.startsWith(peer + '\0')) {
+      reorderBuffers.delete(key)
+      expectedSeqs.delete(key)
+    }
+  }
+}
+
+const reorderTimer = setInterval(() => {
+  const cutoff = Date.now() - 200
+  for (const [key, buf] of reorderBuffers) {
+    const stale = buf.filter(m => m.receivedAt < cutoff)
+    if (stale.length) {
+      const remaining = buf.filter(m => m.receivedAt >= cutoff)
+      if (remaining.length) reorderBuffers.set(key, remaining)
+      else reorderBuffers.delete(key)
+    }
+  }
+}, 100)
 
 // ===========================================================================
 // E2E DELIVERY ACKS
@@ -484,6 +554,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           target: { type: 'string', description: `Peer. Known: ${connectedPeers.join(', ') || '(none)'}` },
           text: { type: 'string' },
           type: { type: 'string', enum: ['request', 'response', 'info'] },
+          request_id: { type: 'string', description: 'Correlate request/response pairs' },
         },
         required: ['target', 'text'],
       },
@@ -530,11 +601,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
   switch (name) {
     case 'myc_send':
-      return { content: [{ type: 'text', text: sendEncrypted(args.target, args.text, args.type ?? 'info', args.target) }] }
+      return { content: [{ type: 'text', text: sendEncrypted(args.target, args.text, args.type ?? 'info', args.target, args.request_id) }] }
 
     case 'myc_broadcast': {
       if (!connectedPeers.length) return { content: [{ type: 'text', text: 'No peers' }] }
-      const results = connectedPeers.map(p => sendEncrypted(p, args.text, args.type ?? 'info', null))
+      const results = connectedPeers.map(p => sendEncrypted(p, args.text, args.type ?? 'info', null, undefined))
       return { content: [{ type: 'text', text: `Broadcast (${connectedPeers.length}): ${results.join('; ')}` }] }
     }
 
@@ -571,7 +642,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 })
 
-function sendEncrypted(target: string, text: string, msgType: string, routeTarget: string | null): string {
+function sendEncrypted(target: string, text: string, msgType: string, routeTarget: string | null, requestId?: string): string {
   const s = peerSessions.get(target)
   if (!s) return `${target} 🔴BLOCKED`
 
@@ -586,6 +657,7 @@ function sendEncrypted(target: string, text: string, msgType: string, routeTarge
     e2e: true, sender: PEER, session_id: sessionId,
     payload: null, msg_id: msgId, seq,
   }
+  if (requestId) body.request_id = requestId
   body.sig = canonicalSign(body)
   wsSend(body)
   if (routeTarget) trackAck(msgId, target)
@@ -620,6 +692,48 @@ mcp.setNotificationHandler(PermReqSchema, async ({ params }) => {
     wsSend(body)
   }
 })
+
+// ===========================================================================
+// PROCESS REGULAR MESSAGE (extracted for reorder buffer)
+// ===========================================================================
+
+async function processRegularMessage(msg: any): Promise<void> {
+  // Hard block on bad/missing signature for E2E messages
+  if (msg.e2e) {
+    // sender field REQUIRED (no more !msg.sender bypass)
+    if (!msg.sender) { log(`🔴 BLOCKED: missing sender field from ${msg.from}`); return }
+    if (msg.sender !== msg.from) { log(`🔴 BLOCKED: sender/from mismatch: ${msg.sender} vs ${msg.from}`); return }
+    if (!msg.sig) { log(`🔴 BLOCKED: unsigned e2e message from ${msg.from}`); return }
+    if (!verifySig(msg.from, msg, msg.sig)) { log(`🔴 BLOCKED: bad signature from ${msg.from}`); return }
+  }
+
+  // Decrypt
+  let content: string
+  if (msg.e2e && msg.encrypted && msg.nonce) {
+    const dec = decryptFrom(msg.from, msg.encrypted, msg.nonce)
+    content = dec ?? `[⚠️ Decrypt failed from ${msg.from}]`
+  } else {
+    content = typeof msg.payload === 'string' ? msg.payload : JSON.stringify(msg.payload)
+  }
+
+  const session = peerSessions.get(msg.from)
+  const tofu = session ? (session.tofuStatus === 'new' ? '🆕' : '🔒') : '🔴'
+  const sig = msg.e2e ? '✅' : (msg.sig ? '✅' : '❌unsigned')
+
+  if (msg.msg_id && msg.from && msg.type !== '_ack') sendAck(msg.from, msg.msg_id)
+
+  await safeNotify({
+    method: 'notifications/claude/channel',
+    params: {
+      content,
+      meta: {
+        from_peer: msg.from, type: msg.type ?? 'info', room: ROOM,
+        msg_id: msg.msg_id ?? '', e2e: msg.e2e ? 'encrypted' : 'plaintext', sig, tofu,
+        ...(msg.request_id ? { request_id: msg.request_id } : {}),
+      },
+    },
+  })
+}
 
 // ===========================================================================
 // WEBSOCKET
@@ -804,46 +918,15 @@ function connectRelay(): void {
     }
 
     // --- REGULAR PEER MESSAGE ---
-
-    // Replay check
-    const { duplicate, seqBad } = checkReplay(msg.from, msg.msg_id, msg.seq, msg.session_id)
+    const { duplicate } = checkReplay(msg.from, msg.msg_id, msg.seq, msg.session_id)
     if (duplicate) { log(`Replay BLOCKED: dup ${msg.msg_id}`); return }
-    if (seqBad) { log(`Replay BLOCKED: seq ${msg.seq} regression`); return }
 
-    // Hard block on bad/missing signature for E2E messages
-    if (msg.e2e) {
-      // sender field REQUIRED (no more !msg.sender bypass)
-      if (!msg.sender) { log(`🔴 BLOCKED: missing sender field from ${msg.from}`); return }
-      if (msg.sender !== msg.from) { log(`🔴 BLOCKED: sender/from mismatch: ${msg.sender} vs ${msg.from}`); return }
-      if (!msg.sig) { log(`🔴 BLOCKED: unsigned e2e message from ${msg.from}`); return }
-      if (!verifySig(msg.from, msg, msg.sig)) { log(`🔴 BLOCKED: bad signature from ${msg.from}`); return }
-    }
-
-    // Decrypt
-    let content: string
-    if (msg.e2e && msg.encrypted && msg.nonce) {
-      const dec = decryptFrom(msg.from, msg.encrypted, msg.nonce)
-      content = dec ?? `[⚠️ Decrypt failed from ${msg.from}]`
+    if (typeof msg.seq === 'number' && msg.session_id) {
+      bufferInsert(msg.from, msg.session_id, msg.seq, msg)
+      await bufferFlush(msg.from, msg.session_id, processRegularMessage)
     } else {
-      content = typeof msg.payload === 'string' ? msg.payload : JSON.stringify(msg.payload)
+      await processRegularMessage(msg)
     }
-
-    const session = peerSessions.get(msg.from)
-    const tofu = session ? (session.tofuStatus === 'new' ? '🆕' : '🔒') : '🔴'
-    const sig = msg.e2e ? '✅' : (msg.sig ? '✅' : '❌unsigned')
-
-    if (msg.msg_id && msg.from && msg.type !== '_ack') sendAck(msg.from, msg.msg_id)
-
-    await safeNotify({
-      method: 'notifications/claude/channel',
-      params: {
-        content,
-        meta: {
-          from_peer: msg.from, type: msg.type ?? 'info', room: ROOM,
-          msg_id: msg.msg_id ?? '', e2e: msg.e2e ? 'encrypted' : 'plaintext', sig, tofu,
-        },
-      },
-    })
   })
 
   ws.addEventListener('close', (e) => {
@@ -915,6 +998,7 @@ async function safeNotify(n: any): Promise<void> {
   function cleanup(): void {
     saveReplay()
     clearInterval(replayTimer)
+    clearInterval(reorderTimer)
     if (reconnectTimer) clearTimeout(reconnectTimer)
     stopHB()
     for (const [, p] of pendingAcks) clearTimeout(p.timer)
