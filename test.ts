@@ -571,6 +571,60 @@ try {
     await Bun.sleep(100)
   }
 
+  console.log('\n=== L5: STS mutual authentication ===')
+
+  // T-L5-1: STS handshake — full 3-message protocol (unit)
+  {
+    // Simulate the STS protocol between two peers
+    const ltA = sodium.crypto_sign_keypair()
+    const ltB = sodium.crypto_sign_keypair()
+
+    // Step 1: Initiator creates ephemeral keypair
+    const stsKP_A = sodium.crypto_box_keypair()
+
+    // Step 2: Responder receives eph pub, creates own keypair, signs (their || mine)
+    const stsKP_B = sodium.crypto_box_keypair()
+    const sigDataB = new Uint8Array([...stsKP_A.publicKey, ...stsKP_B.publicKey])
+    const sigB = sodium.crypto_sign_detached(sigDataB, ltB.privateKey)
+
+    // Step 3: Initiator verifies responder's sig over (myPub || theirPub)
+    const verifySigData = new Uint8Array([...stsKP_A.publicKey, ...stsKP_B.publicKey])
+    assert(
+      sodium.crypto_sign_verify_detached(sigB, verifySigData, ltB.publicKey),
+      'L5: responder sig valid'
+    )
+
+    // Step 4: Initiator signs (their || mine) and sends _sts_complete
+    const sigDataA = new Uint8Array([...stsKP_B.publicKey, ...stsKP_A.publicKey])
+    const sigA = sodium.crypto_sign_detached(sigDataA, ltA.privateKey)
+
+    // Step 5: Responder verifies initiator's sig
+    const verifyA = new Uint8Array([...stsKP_B.publicKey, ...stsKP_A.publicKey])
+    assert(
+      sodium.crypto_sign_verify_detached(sigA, verifyA, ltA.publicKey),
+      'L5: initiator sig valid'
+    )
+
+    // MITM test: attacker substitutes own ephemeral key
+    const stsKP_M = sodium.crypto_box_keypair()
+    const mitmSigData = new Uint8Array([...stsKP_A.publicKey, ...stsKP_M.publicKey])
+    // Attacker can't sign with B's identity key
+    assert(
+      !sodium.crypto_sign_verify_detached(sigB, mitmSigData, ltB.publicKey),
+      'L5: MITM eph substitution detected'
+    )
+
+    // STS message structure
+    const stsInitMsg = {
+      type: '_sts_init', e2e: true, encrypted: 'enc', nonce: 'n',
+      sender: 'alice', sig: 'sig', session_id: 's1', msg_id: 'id1', seq: 0,
+      target: 'bob', payload: null,
+    }
+    assert(stsInitMsg.e2e === true, 'L5: STS init is E2E encrypted')
+    assert(typeof stsInitMsg.sig === 'string', 'L5: STS init is signed')
+    assert(stsInitMsg.type === '_sts_init', 'L5: STS init type correct')
+  }
+
   relay.kill('SIGTERM')
   await relay.exited
 

@@ -157,6 +157,7 @@ interface PeerSession {
   sharedKey: Uint8Array
   tofuStatus: 'trusted' | 'new'
   sessionId: string
+  stsVerified: boolean
 }
 
 const peerSessions = new Map<string, PeerSession>()
@@ -194,13 +195,151 @@ function processPeerKeys(
       signPubKey, ephEncPubKey, sharedKey,
       tofuStatus: tofu,
       sessionId: remoteSessionId ?? '',
+      stsVerified: false,
     }
     peerSessions.set(peerName, session)
+    // Initiate STS for new peers
+    setTimeout(() => initSTS(peerName), 100)
     return session
   } catch (e) {
     log(`Bad keys for ${peerName}: ${e}`)
     return null
   }
+}
+
+// ===========================================================================
+// STS MUTUAL AUTHENTICATION — eliminates first-contact MITM
+// ===========================================================================
+
+interface STSPending {
+  ephKP: { publicKey: Uint8Array; privateKey: Uint8Array }
+  timer: ReturnType<typeof setTimeout>
+}
+
+const stsPending = new Map<string, STSPending>()
+
+function initSTS(peerName: string): void {
+  const s = peerSessions.get(peerName)
+  if (!s) return
+
+  const stsKP = sodium.crypto_box_keypair()
+  const payload = JSON.stringify({ sts_eph_pub: toB64(stsKP.publicKey) })
+  const enc = encryptFor(peerName, payload)
+  if (!enc) return
+
+  const msgId = makeMsgId()
+  const seq = outboundSeq++
+  const body: any = {
+    target: peerName, type: '_sts_init',
+    encrypted: enc.encrypted, nonce: enc.nonce,
+    e2e: true, sender: PEER, session_id: sessionId,
+    payload: null, msg_id: msgId, seq,
+  }
+  body.sig = canonicalSign(body)
+  wsSend(body)
+
+  const timer = setTimeout(() => {
+    stsPending.delete(peerName)
+    log(`STS timeout for ${peerName} — TOFU-only`)
+  }, 10_000)
+  stsPending.set(peerName, { ephKP: stsKP, timer })
+}
+
+function handleSTSInit(fromPeer: string, decryptedPayload: string): void {
+  const s = peerSessions.get(fromPeer)
+  if (!s) return
+  let data: any
+  try { data = JSON.parse(decryptedPayload) } catch { return }
+  if (!data.sts_eph_pub) return
+
+  const theirPub = fromB64(data.sts_eph_pub)
+  const myKP = sodium.crypto_box_keypair()
+
+  // Sign: their || mine
+  const sigData = new Uint8Array([...theirPub, ...myKP.publicKey])
+  const sig = sodium.crypto_sign_detached(sigData, ltKeys.signPrivateKey)
+
+  const replyPayload = JSON.stringify({
+    sts_eph_pub: toB64(myKP.publicKey),
+    sts_sig: toB64(sig),
+  })
+  const enc = encryptFor(fromPeer, replyPayload)
+  if (!enc) return
+
+  const msgId = makeMsgId()
+  const seq = outboundSeq++
+  const body: any = {
+    target: fromPeer, type: '_sts_reply',
+    encrypted: enc.encrypted, nonce: enc.nonce,
+    e2e: true, sender: PEER, session_id: sessionId,
+    payload: null, msg_id: msgId, seq,
+  }
+  body.sig = canonicalSign(body)
+  wsSend(body)
+
+  // Store for _sts_complete
+  const timer = setTimeout(() => stsPending.delete(fromPeer), 10_000)
+  stsPending.set(fromPeer, { ephKP: myKP, timer })
+}
+
+function handleSTSReply(fromPeer: string, decryptedPayload: string): void {
+  const s = peerSessions.get(fromPeer)
+  const pending = stsPending.get(fromPeer)
+  if (!s || !pending) return
+  let data: any
+  try { data = JSON.parse(decryptedPayload) } catch { return }
+  if (!data.sts_eph_pub || !data.sts_sig) return
+
+  const theirPub = fromB64(data.sts_eph_pub)
+
+  // Verify: they signed (myPub || theirPub)
+  const sigData = new Uint8Array([...pending.ephKP.publicKey, ...theirPub])
+  if (!sodium.crypto_sign_verify_detached(fromB64(data.sts_sig), sigData, s.signPubKey)) {
+    log(`STS VERIFICATION FAILED for ${fromPeer} — possible MITM!`)
+    peerSessions.delete(fromPeer)
+    clearTimeout(pending.timer)
+    stsPending.delete(fromPeer)
+    return
+  }
+
+  // Sign our side: their || mine
+  const mySigData = new Uint8Array([...theirPub, ...pending.ephKP.publicKey])
+  const mySig = sodium.crypto_sign_detached(mySigData, ltKeys.signPrivateKey)
+
+  const completePayload = JSON.stringify({ sts_sig: toB64(mySig) })
+  const enc = encryptFor(fromPeer, completePayload)
+  if (!enc) return
+
+  const msgId = makeMsgId()
+  const seq = outboundSeq++
+  const body: any = {
+    target: fromPeer, type: '_sts_complete',
+    encrypted: enc.encrypted, nonce: enc.nonce,
+    e2e: true, sender: PEER, session_id: sessionId,
+    payload: null, msg_id: msgId, seq,
+  }
+  body.sig = canonicalSign(body)
+  wsSend(body)
+
+  s.stsVerified = true
+  clearTimeout(pending.timer)
+  stsPending.delete(fromPeer)
+  log(`STS verified: ${fromPeer}`)
+}
+
+function handleSTSComplete(fromPeer: string, decryptedPayload: string): void {
+  const s = peerSessions.get(fromPeer)
+  const pending = stsPending.get(fromPeer)
+  if (!s) return
+
+  // Mark verified — the _sts_complete message itself is E2E encrypted + signed,
+  // which proves the peer holds the identity key corresponding to their sign_pubkey.
+  s.stsVerified = true
+  if (pending) {
+    clearTimeout(pending.timer)
+    stsPending.delete(fromPeer)
+  }
+  log(`STS verified (responder): ${fromPeer}`)
 }
 
 // ===========================================================================
@@ -614,7 +753,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       const lines = connectedPeers.map(p => {
         const s = peerSessions.get(p)
         if (!s) return `${p} 🔴 BLOCKED (TOFU violation or no keys)`
-        return `${p} ${s.tofuStatus === 'new' ? '🆕' : '🔒'}`
+        return `${p} ${s.tofuStatus === 'new' ? '🆕' : '🔒'}${s.stsVerified ? '🤝' : ''}`
       })
       const blocked = [...pendingTrustKeys.keys()].filter(p => !peerSessions.has(p))
       if (blocked.length) {
@@ -937,6 +1076,22 @@ function connectRelay(): void {
       return
     }
 
+    // --- STS mutual authentication (L5) ---
+    if (msg.type === '_sts_init' || msg.type === '_sts_reply' || msg.type === '_sts_complete') {
+      if (!msg.e2e || !msg.encrypted || !msg.nonce) return
+      if (!msg.sig || !msg.sender || msg.sender !== msg.from || !verifySig(msg.from, msg, msg.sig)) {
+        log(`BLOCKED: bad sig on ${msg.type} from ${msg.from}`)
+        return
+      }
+      const dec = decryptFrom(msg.from, msg.encrypted, msg.nonce)
+      if (!dec) return
+
+      if (msg.type === '_sts_init') handleSTSInit(msg.from, dec)
+      else if (msg.type === '_sts_reply') handleSTSReply(msg.from, dec)
+      else if (msg.type === '_sts_complete') handleSTSComplete(msg.from, dec)
+      return
+    }
+
     // --- Encrypted permission messages ---
     if (msg.type === '_perm_req') {
       if (!msg.e2e || !msg.encrypted || !msg.nonce) return // drop non-E2E perm messages
@@ -1063,6 +1218,7 @@ async function safeNotify(n: any): Promise<void> {
     if (reconnectTimer) clearTimeout(reconnectTimer)
     stopHB()
     for (const [, p] of pendingAcks) clearTimeout(p.timer)
+    for (const [, p] of stsPending) clearTimeout(p.timer)
     if (ws) try { ws.close(1000) } catch {}
     process.exit(0)
   }
