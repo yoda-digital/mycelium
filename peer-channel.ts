@@ -21,7 +21,8 @@ const fromB64 = (x: string) => sodium.from_base64(x, sodium.base64_variants.ORIG
 import { dirname, resolve } from 'path'
 import { homedir } from 'os'
 
-const RELAY = process.env.MYC_RELAY
+const RELAY_LIST = (process.env.MYC_RELAY ?? '').split(',').map(s => s.trim()).filter(Boolean)
+let relayIdx = 0
 const TOKEN = process.env.MYC_TOKEN
 const PEER = process.env.MYC_PEER
 const ROOM = process.env.MYC_ROOM ?? 'default'
@@ -29,7 +30,7 @@ const KEY_FILE = process.env.MYC_KEY_FILE ?? resolve(homedir(), '.mycelium-keys.
 const TOFU_FILE = process.env.MYC_TOFU_FILE ?? resolve(homedir(), '.mycelium-known-peers.json')
 const REPLAY_FILE = process.env.MYC_REPLAY_FILE ?? resolve(homedir(), '.mycelium-replay-state.json')
 
-if (!RELAY || !TOKEN || !PEER) {
+if (!RELAY_LIST.length || !TOKEN || !PEER) {
   console.error('Required: MYC_RELAY, MYC_TOKEN, MYC_PEER')
   process.exit(1)
 }
@@ -634,10 +635,11 @@ function connectRelay(): void {
   // 16-byte session ID (128-bit)
   sessionId = generateSessionId()
   outboundSeq = 0
-  log(`Session: ${sessionId.slice(0, 8)}...`)
+  const url = RELAY_LIST[relayIdx % RELAY_LIST.length]
+  log(`Session: ${sessionId.slice(0, 8)}... → relay ${relayIdx % RELAY_LIST.length + 1}/${RELAY_LIST.length}`)
 
   try {
-    ws = new WebSocket(RELAY!)
+    ws = new WebSocket(url)
   } catch (e) {
     log(`WS fail: ${e}`)
     scheduleReconnect()
@@ -869,6 +871,7 @@ function updatePeerList(peersMap: any): void {
 
 function scheduleReconnect(): void {
   if (reconnectTimer) return
+  relayIdx++
   const delay = getBackoffMs()
   reconnectAttempt++
   log(`Reconnect ${(delay / 1000).toFixed(1)}s (attempt ${reconnectAttempt})`)

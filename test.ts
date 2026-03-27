@@ -491,6 +491,17 @@ try {
     assert(sodium.crypto_sign_verify_detached(sig, sodium.from_string(canonical), signKP.publicKey), 'original sig intact ✓')
   }
 
+  console.log('\n=== L4: Multi-relay failover ===')
+  {
+    const relays = 'ws://a.com,ws://b.com, ws://c.com'.split(',').map(s => s.trim()).filter(Boolean)
+    assert(relays.length === 3, 'L4: parses 3 relays')
+    assert(relays[1] === 'ws://b.com', 'L4: trims whitespace')
+  }
+  {
+    const relays = 'ws://a.com'.split(',').map(s => s.trim()).filter(Boolean)
+    assert(relays.length === 1, 'L4: single relay backward compat')
+  }
+
   relay.kill('SIGTERM')
   await relay.exited
 
