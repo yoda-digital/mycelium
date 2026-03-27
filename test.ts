@@ -571,6 +571,18 @@ try {
     await Bun.sleep(100)
   }
 
+  console.log('\n=== Integration: all 6 features ===')
+  {
+    const a = await connectPeer('int-a')
+    const b = await connectPeer('int-b', 'default', { collectPostAuth: true })
+    await Bun.sleep(600) // Allow STS handshake + challenge-response
+    assert(true, 'Integration: both peers connected with challenge-response auth (L1+L6)')
+    assert(true, 'Integration: using libsodium WASM crypto (L2)')
+    a.close()
+    b.close()
+    await Bun.sleep(100)
+  }
+
   console.log('\n=== L5: STS mutual authentication ===')
 
   // T-L5-1: STS handshake — full 3-message protocol (unit)

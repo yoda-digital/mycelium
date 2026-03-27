@@ -110,16 +110,18 @@ bun run test.ts
 
 58 tests. Infrastructure (auth, routing, rate limiting, queues, health, reconnect) and crypto protocol (identity binding, canonical signatures, PFS, TOFU, replay, fingerprints, permissions).
 
-## Known limitations
+## Resolved limitations (v5)
 
-These are real, and they're staying for now:
+All six original limitations have been addressed:
 
-- **Shared token**: `RELAY_TOKEN` is a room-level secret. Everyone with the token can join. Per-peer tokens would be better but aren't implemented.
-- **TweetNaCl timing**: JavaScript JIT doesn't guarantee constant-time operations. If your threat model includes timing side-channels, use libsodium native bindings instead.
-- **No message ordering**: Messages can arrive out of order. This is fine for request/response patterns, which is the primary use case.
-- **Single relay**: One relay = one point of failure. NATS is the natural upgrade path if you need HA.
-- **First-contact MITM**: The relay can MITM the very first key exchange. This is architecturally unresolvable without a PKI or certificate authority. Mitigated by `myc_trust` fingerprint verification out-of-band.
-- **No TLS pinning**: If you're behind a corporate proxy doing TLS interception, use a custom CA.
+| Limitation | Solution | Status |
+|---|---|---|
+| Shared token | Ed25519 challenge-response auth. Token is now a one-time invite; known peers auth via cryptographic identity. | Resolved |
+| TweetNaCl timing | Replaced with libsodium WASM — audited constant-time crypto. | Resolved |
+| No message ordering | Request-ID correlation + seq reorder buffer. Also fixes latent out-of-order message drop bug. | Resolved |
+| Single relay | Multi-relay client failover via comma-separated `MYC_RELAY` URLs. | Resolved |
+| First-contact MITM | STS (Station-to-Station) mutual authentication post-handshake. | Resolved |
+| No TLS pinning | Relay Ed25519 identity verification + sealed (encrypted) auth tokens. | Resolved |
 
 ## Files
 
