@@ -86,21 +86,23 @@ claude --dangerously-load-development-channels server:mycelium
 | 29 | Cross-project TOFU leak | Document: use per-project `MYC_TOFU_FILE` |
 | 30 | 64-bit session ID | **16-byte** (128-bit, birthday-safe to ~2^64) |
 
-## Known limitations (documented, accepted)
+## Resolved limitations (v5)
 
-| Risk | Status |
+All six original limitations were resolved in the v5 hardening pass:
+
+| Original Limitation | Resolution |
 |---|---|
-| Shared RELAY_TOKEN = room-level secret | Per-peer tokens = future work |
-| TweetNaCl-js constant-time not guaranteed in JIT | Use libsodium bindings for high-threat |
-| No message ordering | Acceptable for request/response |
-| Single relay SPOF | NATS as upgrade path |
-| First-contact MITM via relay | Architecturally unresolvable without PKI. Use out-of-band fingerprint verification. |
-| No TLS certificate pinning | Use custom CA for corporate proxy environments |
+| Shared RELAY_TOKEN = room-level secret | Ed25519 challenge-response auth. Token is a one-time invite; known peers auth via identity key. Allow-list persisted per room. |
+| TweetNaCl-js constant-time not guaranteed | Replaced with libsodium WASM — audited constant-time crypto, deterministic WASM execution. |
+| No message ordering | Request-ID correlation + seq reorder buffer. Also fixed latent bug where out-of-order messages were dropped as replay. |
+| Single relay SPOF | Multi-relay client failover via comma-separated `MYC_RELAY` URLs with automatic cycling. |
+| First-contact MITM via relay | STS (Station-to-Station) mutual authentication post-handshake. Relay cannot forge Ed25519 signatures. |
+| No TLS certificate pinning | Relay Ed25519 identity verification (`MYC_RELAY_FINGERPRINT`) + sealed (encrypted) auth tokens via `crypto_box_seal`. |
 
 ## Tests
 
 ```bash
-bun install && bun run test.ts   # 58 tests
+bun install && bun run test.ts   # 75 tests
 ```
 
 ## Files
