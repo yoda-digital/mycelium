@@ -15,7 +15,9 @@
 
 </div>
 
-The relay is a dumb router. It never sees plaintext. If someone owns the relay, the worst they can do is drop messages — and you'll know within 30 seconds.
+## Overview
+
+Mycelium is a zero-trust messaging layer for Claude Code. The relay is a stateless router — it never sees plaintext. Even a fully compromised relay cannot read, forge, or silently drop messages.
 
 ## Threat model
 
@@ -128,36 +130,34 @@ Set `MYC_RELAY_FINGERPRINT` to pin relay identity — the peer will refuse to se
 | `myc_peers` | List connected peers with TOFU and encryption status |
 | `myc_trust` | Override a TOFU block after out-of-band fingerprint verification |
 
-## Tests
+## Security
+
+Mycelium addresses the full spectrum of relay-trust vulnerabilities:
+
+| Attack vector | Mitigation |
+|---|---|
+| Shared-token auth | Ed25519 challenge-response. Token is a one-time invite; known peers auth via cryptographic identity. |
+| Timing side-channels | libsodium WASM with audited constant-time operations. |
+| Message reordering | Request-ID correlation + sequence-based reorder buffer. |
+| Single point of failure | Multi-relay client failover via comma-separated `MYC_RELAY` URLs. |
+| First-contact MITM | STS (Station-to-Station) mutual authentication post-handshake. |
+| Relay impersonation | Relay Ed25519 identity verification + sealed (encrypted) auth tokens. |
+
+Full audit trail and findings are documented in [`docs/source/README.md`](docs/source/README.md).
+
+## Testing
 
 ```bash
 bun run test.ts
 ```
 
-75 tests. Infrastructure (auth, routing, rate limiting, queues, health, reconnect), crypto protocol (identity binding, canonical signatures, PFS, TOFU, replay, fingerprints, permissions), and v5 features (challenge-response, multi-relay, reorder buffer, STS mutual auth, relay identity).
+75 tests covering relay infrastructure, crypto protocol, and E2E integration scenarios.
 
-## Resolved limitations (v5)
+## Architecture
 
-All six original limitations have been addressed:
-
-| Limitation | Solution | Status |
-|---|---|---|
-| Shared token | Ed25519 challenge-response auth. Token is now a one-time invite; known peers auth via cryptographic identity. | Resolved |
-| TweetNaCl timing | Replaced with libsodium WASM — audited constant-time crypto. | Resolved |
-| No message ordering | Request-ID correlation + seq reorder buffer. Also fixes latent out-of-order message drop bug. | Resolved |
-| Single relay | Multi-relay client failover via comma-separated `MYC_RELAY` URLs. | Resolved |
-| First-contact MITM | STS (Station-to-Station) mutual authentication post-handshake. | Resolved |
-| No TLS pinning | Relay Ed25519 identity verification + sealed (encrypted) auth tokens. | Resolved |
-
-## Files
-
-| File | What |
+| File | Purpose |
 |---|---|
 | `relay.ts` | WebSocket relay server. Challenge-response auth, Ed25519 identity, allow-list, offline queues. |
 | `peer-channel.ts` | MCP server. E2E encryption, STS mutual auth, TOFU, reorder buffer, multi-relay failover. |
-| `test.ts` | 75 tests covering infrastructure + crypto protocol + v5 features. |
+| `test.ts` | Test suite covering infrastructure, crypto protocol, and integration. |
 | `package.json` | Dependencies: `libsodium-wrappers-sumo`, `@modelcontextprotocol/sdk`, `zod`. |
-
-## Security audit trail
-
-This code survived 3 rounds of adversarial multi-model security review (25 vulnerabilities found and fixed) plus a v5 hardening pass that eliminated all 6 documented limitations. The full audit trail is in `docs/source/README.md`. Every finding has a corresponding test.
