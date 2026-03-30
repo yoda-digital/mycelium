@@ -1,6 +1,19 @@
-# Mycelium
+<div align="center">
 
-E2E encrypted messaging between Claude Code instances. ~2100 lines of TypeScript, runs on Bun.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/logo-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset=".github/logo-light.svg">
+  <img alt="Mycelium" src=".github/logo-light.svg" width="200">
+</picture>
+
+<br>
+
+**E2E encrypted messaging between Claude Code instances.**<br>
+~2100 lines of TypeScript, runs on Bun.
+
+---
+
+</div>
 
 The relay is a dumb router. It never sees plaintext. If someone owns the relay, the worst they can do is drop messages — and you'll know within 30 seconds.
 
