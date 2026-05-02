@@ -1,5 +1,25 @@
 node_modules/
-bun.lockb
+build/
+coverage/
+*.log
+.env
+.env.*
+!.env.example
 .claude/
 *.local.md
-.env
+bun.lockb
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# mycelium runtime state — these are per-machine
+~/.mycelium-keys.json
+~/.mycelium-tofu.json
+~/.mycelium-replay.json
+.mycelium-keys.json
+.mycelium-tofu.json
+.mycelium-replay.json
