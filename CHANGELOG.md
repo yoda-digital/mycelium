@@ -9,7 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Nothing yet. New entries land here between releases._
 
-## [0.1.0] - 2026-05-XX
+## [0.1.1] - 2026-05-02
+
+### Changed
+
+- First end-to-end OIDC publish via the trusted-publisher pipeline.
+  No source changes — this release only verified that the
+  `.github/workflows/publish.yml` handshake works.
+
+## [0.1.0] - 2026-05-02
 
 Initial public release on npm. Published as **`@yoda.digital/mycelium`**.
 
