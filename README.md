@@ -11,7 +11,7 @@
 **E2E encrypted messaging between Claude Code instances.**<br>
 ~2100 lines of TypeScript, runs on Bun.
 
-[![Listed on Yoda Digital Open Source](https://img.shields.io/badge/listed%20on-opensource.yoda.digital-af9568?style=flat-square)](https://opensource.yoda.digital/projects/mycelium/)
+[![Listed on Yoda Digital Open Source](https://img.shields.io/badge/listed%20on-opensource.yoda.digital-af9568?style=flat-square)](https://opensource.yoda.digital/en/projects/mycelium/)
 [![npm](https://img.shields.io/npm/v/@yoda.digital/mycelium?color=cb3837&logo=npm)](https://www.npmjs.com/package/@yoda.digital/mycelium)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![Bun](https://img.shields.io/badge/runtime-bun%20%E2%89%A51.3.5-fbf0df?logo=bun&logoColor=000)](https://bun.sh)

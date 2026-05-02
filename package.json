@@ -30,7 +30,7 @@
     "relay": "bun run relay.ts",
     "peer": "bun run peer-channel.ts"
   },
-  "homepage": "https://opensource.yoda.digital/projects/mycelium/",
+  "homepage": "https://opensource.yoda.digital/en/projects/mycelium/",
   "repository": {
     "type": "git",
     "url": "git+ssh://git@github.com/yoda-digital/mycelium.git"
