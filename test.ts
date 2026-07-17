@@ -525,10 +525,18 @@ try {
     assert(sodium.crypto_sign_verify_detached(sig, sodium.from_string(canonical), signKP.publicKey), 'original sig intact ✓')
   }
 
-  console.log('\n=== L3: Message ordering ===')
+  console.log('\n=== L3: request_id is covered by the canonical signature ===')
   {
-    // Test that request_id appears in canonical signature fields
-    assert(true, 'L3: request_id in canonical sig (structural)')
+    const kp = sodium.crypto_sign_keypair()
+    const canon = (m: any) => JSON.stringify({
+      e2e: m.e2e, encrypted: m.encrypted, msg_id: m.msg_id, nonce: m.nonce,
+      payload: m.payload, request_id: m.request_id, sender: m.sender, seq: m.seq,
+      session_id: m.session_id, target: m.target, type: m.type,
+    })
+    const base = { e2e: true, encrypted: 'e', msg_id: 'm', nonce: 'n', payload: null, request_id: 'r1', sender: 'a', seq: 0, session_id: 's', target: 'b', type: 'info' }
+    const sig = sodium.crypto_sign_detached(sodium.from_string(canon(base)), kp.privateKey)
+    assert(sodium.crypto_sign_verify_detached(sig, sodium.from_string(canon(base)), kp.publicKey), 'L3: original request_id verifies')
+    assert(!sodium.crypto_sign_verify_detached(sig, sodium.from_string(canon({ ...base, request_id: 'r2' })), kp.publicKey), 'L3: tampering request_id breaks the sig')
   }
 
   console.log('\n=== L4: Multi-relay failover ===')
@@ -571,13 +579,16 @@ try {
     await Bun.sleep(100)
   }
 
-  console.log('\n=== Integration: all 6 features ===')
+  // NOTE: real two-peer E2E delivery (STS, encryption, broadcast, acks) is exercised
+  // by test-integration.ts, which spawns actual peer-channel.ts processes. This block
+  // only asserts that two challenge-response-authenticated relay clients coexist.
+  console.log('\n=== Relay integration: two authenticated peers coexist ===')
   {
     const a = await connectPeer('int-a')
     const b = await connectPeer('int-b', 'default', { collectPostAuth: true })
-    await Bun.sleep(600) // Allow STS handshake + challenge-response
-    assert(true, 'Integration: both peers connected with challenge-response auth (L1+L6)')
-    assert(true, 'Integration: using libsodium WASM crypto (L2)')
+    await Bun.sleep(300)
+    assert(a.readyState === WebSocket.OPEN && b.readyState === WebSocket.OPEN, 'both peers authenticated and connected')
+    assert(Array.isArray((b as any).postAuthMsgs), 'post-auth relay message stream active')
     a.close()
     b.close()
     await Bun.sleep(100)

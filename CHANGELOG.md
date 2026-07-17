@@ -9,6 +9,110 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Nothing yet. New entries land here between releases._
 
+## [0.2.0] - 2026-07-17
+
+Correctness release. v0.1.x could not deliver a single message between two peers;
+this release fixes that and the surrounding class of protocol bugs, and adds the
+real two-peer end-to-end test coverage whose absence let the regression ship green.
+
+### Fixed
+
+- **CRITICAL — total delivery failure (STS handshake collision).** Both peers are
+  symmetric and both initiated the STS exchange, but `stsPending` was keyed only by
+  peer name, so each side's responder role clobbered its initiator ephemeral key.
+  Every session then failed STS verification, which called `peerSessions.delete()`
+  and tore down encryption — so `myc_send`/`myc_broadcast` returned `🔴BLOCKED` and
+  no message was ever delivered. STS is redesigned: exactly one peer initiates (the
+  lexicographically smaller name), the signed value is a deterministic name-ordered
+  binding over **both session ephemerals + both session_ids**, and **STS never tears
+  down a session** — a mismatch merely leaves it TOFU/eph-sig-authenticated but not
+  mutually-verified. The channel was already authenticated by `eph_enc_pubkey_sig`
+  before STS ran; STS is now a correct, live, mutual channel-confirmation on top.
+- **CRITICAL — reorder buffer silently dropped messages.** The buffer assumed the
+  regular-message `seq` stream started contiguously at 0, but control frames
+  (`_sts`/`_ack`/`_perm`) share the same `outboundSeq` counter, so the first data
+  message was buffered awaiting a seq that never arrived and then discarded by the
+  200ms stale-timer without ever being delivered. Removed the buffer: a peer holds
+  one relay connection at a time and the relay forwards in order, so messages are
+  delivered immediately in arrival order; `msg_id` dedup + the signed `seq` remain
+  the replay defense.
+- **HIGH — broadcast fan-out produced decrypt-failure spam.** `myc_broadcast` routed
+  each per-recipient ciphertext with `target=null`, so the relay fanned every copy to
+  every peer and each peer received N−1 undecryptable copies. Broadcast is now true
+  N×unicast (each copy routed to its specific recipient); exactly one decryptable copy
+  per peer.
+- **relay per-IP connection limit was a global cap.** `resolveIp` returned a constant
+  `'direct'` for every non-proxied client, collapsing `RELAY_MAX_IP_CONNS` into a
+  single global limit. It now uses the real socket address (`server.requestIP`).
+- **broken published binaries (double shebang).** The build added a shebang banner on
+  top of the source files' own shebang, so `build/relay.js` / `build/peer-channel.js`
+  had two `#!` lines and crashed with a syntax error on run — the `mycelium-relay` /
+  `mycelium-peer` bins shipped in 0.1.x did not start at all. Dropped the banner (the
+  source shebang carries through) and added a `prepublishOnly` build+typecheck gate.
+- **relay sole-member reconnect orphaned the peer.** A same-identity reconnect by a
+  room's only member evicted the old connection, which deleted the now-empty room map,
+  leaving the new peer registered in a detached map (invisible to routing/ping). The
+  room map is now re-acquired after eviction.
+- **unauthenticated plaintext injection bypassed the sig hard-block.** The "bad/missing
+  signature = hard block" guard only ran for `e2e` frames, so a non-`e2e` frame from a
+  malicious relay was delivered to the model verbatim. Non-E2E and undecryptable peer
+  frames are now hard-blocked.
+- **reserved control-type injection via tools.** `myc_send`/`myc_broadcast` passed the
+  caller-supplied `type` straight onto the wire, letting a prompt-injected local model
+  emit a reserved control frame (`_sts_*`/`_ack`/`_perm_*`) — e.g. a forged permission
+  verdict. Types are now restricted to the public data set.
+- **delivery acks weren't bound to the target.** `handleAck` cleared a pending ack by
+  id regardless of sender; it now requires the ack to come from the message's target.
+- **`msg_id` dedup was globally keyed and seq was never enforced.** Dedup is now scoped
+  to the (unspoofable) sender so one peer can't burn another's `msg_id` namespace, and
+  the signed `seq` is enforced monotonic per session as a real replay defense. Both are
+  consulted and committed **only after signature verification**, so a malicious relay
+  cannot inject a forged high-seq frame to poison the monotonic floor and silently drop
+  the real sender's future messages.
+- **relay lied about queued/dropped messages.** A unicast dropped under backpressure,
+  or an offline message discarded by a queue cap, is now reported to the sender instead
+  of silently dropped / falsely reported as `queued`.
+- **constant-time credential comparison.** The shared token and health bearer are now
+  compared in constant time (hash + `memcmp`), matching the documented posture.
+- **typecheck now clean under `strict`.** Fixed the `Bun.serve`/`server.upgrade` data
+  generic (`relay.ts`) and enabled `strict: true` (strict null checks); `bunx tsc
+  --noEmit` passes with zero errors.
+- Stale per-session timers (STS/ack) are cleared on reconnect; removed the unused
+  `main` entry (side-effectful CLI); fixed docs (STS/first-contact claims, `stateless`
+  overstatement, INSTALL.md config path, npm-excluded doc link).
+
+### Added
+
+- **`test-integration.ts` — real end-to-end suite.** Spawns a relay and two actual
+  `peer-channel.ts` MCP processes and asserts genuine delivery: STS mutual
+  verification, unicast/broadcast each deliver exactly one decrypted copy, bidirectional
+  reply, a 20-message burst delivered in order with no drops, `myc_peers` status, and a
+  hard-blocked plaintext-injection attempt.
+- **`test-replay-poison.ts` — malicious-relay regression test.** Runs a real
+  `peer-channel.ts` against a mock relay that forges a bad-signature high-seq frame, and
+  asserts a subsequent legitimate low-seq message is still delivered (the seq floor is
+  not poisoned). `bun run test` runs the unit, integration, and this suite.
+
+### Changed
+
+- Consolidated the on-wire envelope construction (`sendCtrl`) so every message type
+  (data, STS, ack, permission) is built and canonically signed identically.
+
+### Notes / known limitations
+
+- **Offline delivery is best-effort and does not cover E2E messages.** A peer can only
+  encrypt to a peer it currently shares a session with, so once a target has fully left
+  the room a sender cannot produce a ciphertext for it — the relay's offline queue is
+  therefore only reachable in narrow windows and cannot store-and-forward forward-secret
+  traffic. Undelivered unicasts surface via the 30s ack timeout.
+- **First-contact trust is TOFU.** STS confirms the agreed session against TOFU-pinned
+  identities but cannot, by itself, defeat a relay that MITMs the very first contact —
+  verify fingerprints out-of-band with `myc_trust` for first-contact assurance.
+- Challenge-response remains opt-in via `RELAY_REQUIRE_CHALLENGE` (default off) for
+  backward compatibility; enabling it is recommended for new deployments.
+- The remote permission-approval loop is intentionally receive-only: `_perm_req` is
+  forwarded to peers, but verdict emission depends on host support and is not fabricated.
+
 ## [0.1.1] - 2026-05-02
 
 ### Changed
