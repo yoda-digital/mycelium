@@ -12,9 +12,10 @@
     "resolveJsonModule": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "strict": false,
+    "strict": true,
+    "noImplicitAny": false,
     "types": ["bun"]
   },
-  "include": ["relay.ts", "peer-channel.ts", "test.ts"],
+  "include": ["relay.ts", "peer-channel.ts", "test.ts", "test-integration.ts"],
   "exclude": ["node_modules", "build", "coverage", "docs"]
 }

@@ -208,118 +208,92 @@ function processPeerKeys(
 }
 
 // ===========================================================================
-// STS MUTUAL AUTHENTICATION — eliminates first-contact MITM
+// STS MUTUAL AUTHENTICATION — session confirmation on top of signed key exchange
 // ===========================================================================
+//
+// The Curve25519 ephemeral that derives the shared key is ALREADY bound to each
+// peer's Ed25519 identity via `eph_enc_pubkey_sig` (verified in processPeerKeys),
+// so the DH exchange is authenticated and relay-MITM-resistant before STS runs.
+// STS adds an explicit, live, mutually-confirmed channel binding over BOTH session
+// ephemerals + BOTH session_ids, signed with the long-term identity keys.
+//
+// Design invariants (fixing the v0.1.x collision that broke all delivery):
+//   • Exactly ONE peer initiates — the lexicographically smaller name — so the two
+//     symmetric peers never clobber each other's pending state.
+//   • The signed bytes are a deterministic, name-ordered binding both sides derive
+//     identically (no throwaway keypairs, nothing to mis-pair).
+//   • STS NEVER tears down the session. A mismatch leaves the channel
+//     TOFU/eph-sig-authenticated and simply un-flags `stsVerified`.
 
 interface STSPending {
-  ephKP: { publicKey: Uint8Array; privateKey: Uint8Array }
   timer: ReturnType<typeof setTimeout>
 }
 
 const stsPending = new Map<string, STSPending>()
 
-function initSTS(peerName: string): void {
+function stsIsInitiator(peerName: string): boolean {
+  return PEER! < peerName
+}
+
+// Deterministic binding both peers compute identically: name-ordered
+// (loEph || hiEph || loSid || hiSid). Session-specific ⇒ no cross-session replay.
+function stsBinding(peerName: string): Uint8Array | null {
   const s = peerSessions.get(peerName)
-  if (!s) return
+  if (!s) return null
+  const mine = { name: PEER!, eph: ephKeys.encPublicKey, sid: sessionId }
+  const theirs = { name: peerName, eph: s.ephEncPubKey, sid: s.sessionId }
+  const [a, b] = mine.name < theirs.name ? [mine, theirs] : [theirs, mine]
+  return new Uint8Array([
+    ...a.eph, ...b.eph,
+    ...sodium.from_string(a.sid), ...sodium.from_string(b.sid),
+  ])
+}
 
-  const stsKP = sodium.crypto_box_keypair()
-  const payload = JSON.stringify({ sts_eph_pub: toB64(stsKP.publicKey) })
-  const enc = encryptFor(peerName, payload)
+function initSTS(peerName: string): void {
+  if (!stsIsInitiator(peerName)) return // responder waits for _sts_init
+  if (!peerSessions.has(peerName)) return
+  const enc = encryptFor(peerName, JSON.stringify({ sts: 'init' }))
   if (!enc) return
-
-  const msgId = makeMsgId()
-  const seq = outboundSeq++
-  const body: any = {
-    target: peerName, type: '_sts_init',
-    encrypted: enc.encrypted, nonce: enc.nonce,
-    e2e: true, sender: PEER, session_id: sessionId,
-    payload: null, msg_id: msgId, seq,
-  }
-  body.sig = canonicalSign(body)
-  wsSend(body)
-
+  sendCtrl(peerName, '_sts_init', enc)
   const timer = setTimeout(() => {
     stsPending.delete(peerName)
-    log(`STS timeout for ${peerName} — TOFU-only`)
+    log(`STS timeout for ${peerName} — TOFU/eph-sig authenticated only`)
   }, 10_000)
-  stsPending.set(peerName, { ephKP: stsKP, timer })
+  stsPending.set(peerName, { timer })
 }
 
-function handleSTSInit(fromPeer: string, decryptedPayload: string): void {
-  const s = peerSessions.get(fromPeer)
-  if (!s) return
-  let data: any
-  try { data = JSON.parse(decryptedPayload) } catch { return }
-  if (!data.sts_eph_pub) return
-
-  const theirPub = fromB64(data.sts_eph_pub)
-  const myKP = sodium.crypto_box_keypair()
-
-  // Sign: their || mine
-  const sigData = new Uint8Array([...theirPub, ...myKP.publicKey])
-  const sig = sodium.crypto_sign_detached(sigData, ltKeys.signPrivateKey)
-
-  const replyPayload = JSON.stringify({
-    sts_eph_pub: toB64(myKP.publicKey),
-    sts_sig: toB64(sig),
-  })
-  const enc = encryptFor(fromPeer, replyPayload)
+// Responder: prove agreement on the binding by signing it and replying.
+function handleSTSInit(fromPeer: string): void {
+  const binding = stsBinding(fromPeer)
+  if (!binding) return
+  const sig = toB64(sodium.crypto_sign_detached(binding, ltKeys.signPrivateKey))
+  const enc = encryptFor(fromPeer, JSON.stringify({ sts_sig: sig }))
   if (!enc) return
-
-  const msgId = makeMsgId()
-  const seq = outboundSeq++
-  const body: any = {
-    target: fromPeer, type: '_sts_reply',
-    encrypted: enc.encrypted, nonce: enc.nonce,
-    e2e: true, sender: PEER, session_id: sessionId,
-    payload: null, msg_id: msgId, seq,
-  }
-  body.sig = canonicalSign(body)
-  wsSend(body)
-
-  // Store for _sts_complete
-  const timer = setTimeout(() => stsPending.delete(fromPeer), 10_000)
-  stsPending.set(fromPeer, { ephKP: myKP, timer })
+  sendCtrl(fromPeer, '_sts_reply', enc)
 }
 
+// Initiator: verify responder's binding signature, then confirm our own side.
 function handleSTSReply(fromPeer: string, decryptedPayload: string): void {
   const s = peerSessions.get(fromPeer)
   const pending = stsPending.get(fromPeer)
   if (!s || !pending) return
   let data: any
   try { data = JSON.parse(decryptedPayload) } catch { return }
-  if (!data.sts_eph_pub || !data.sts_sig) return
+  if (!data.sts_sig) return
 
-  const theirPub = fromB64(data.sts_eph_pub)
-
-  // Verify: they signed (myPub || theirPub)
-  const sigData = new Uint8Array([...pending.ephKP.publicKey, ...theirPub])
-  if (!sodium.crypto_sign_verify_detached(fromB64(data.sts_sig), sigData, s.signPubKey)) {
-    log(`STS VERIFICATION FAILED for ${fromPeer} — possible MITM!`)
-    peerSessions.delete(fromPeer)
+  const binding = stsBinding(fromPeer)
+  if (!binding) return
+  if (!sodium.crypto_sign_verify_detached(fromB64(data.sts_sig), binding, s.signPubKey)) {
+    // eph-sig already authenticated the channel — do NOT delete the session.
+    log(`STS mismatch for ${fromPeer} — staying TOFU/eph-sig authenticated, not mutually-verified`)
     clearTimeout(pending.timer)
     stsPending.delete(fromPeer)
     return
   }
 
-  // Sign our side: their || mine
-  const mySigData = new Uint8Array([...theirPub, ...pending.ephKP.publicKey])
-  const mySig = sodium.crypto_sign_detached(mySigData, ltKeys.signPrivateKey)
-
-  const completePayload = JSON.stringify({ sts_sig: toB64(mySig) })
-  const enc = encryptFor(fromPeer, completePayload)
-  if (!enc) return
-
-  const msgId = makeMsgId()
-  const seq = outboundSeq++
-  const body: any = {
-    target: fromPeer, type: '_sts_complete',
-    encrypted: enc.encrypted, nonce: enc.nonce,
-    e2e: true, sender: PEER, session_id: sessionId,
-    payload: null, msg_id: msgId, seq,
-  }
-  body.sig = canonicalSign(body)
-  wsSend(body)
+  const mySig = toB64(sodium.crypto_sign_detached(binding, ltKeys.signPrivateKey))
+  const enc = encryptFor(fromPeer, JSON.stringify({ sts_sig: mySig }))
+  if (enc) sendCtrl(fromPeer, '_sts_complete', enc)
 
   s.stsVerified = true
   clearTimeout(pending.timer)
@@ -327,18 +301,20 @@ function handleSTSReply(fromPeer: string, decryptedPayload: string): void {
   log(`STS verified: ${fromPeer}`)
 }
 
+// Responder: verify initiator's binding signature to complete mutual confirmation.
 function handleSTSComplete(fromPeer: string, decryptedPayload: string): void {
   const s = peerSessions.get(fromPeer)
-  const pending = stsPending.get(fromPeer)
   if (!s) return
-
-  // Mark verified — the _sts_complete message itself is E2E encrypted + signed,
-  // which proves the peer holds the identity key corresponding to their sign_pubkey.
-  s.stsVerified = true
-  if (pending) {
-    clearTimeout(pending.timer)
-    stsPending.delete(fromPeer)
+  let data: any
+  try { data = JSON.parse(decryptedPayload) } catch { return }
+  if (!data.sts_sig) return
+  const binding = stsBinding(fromPeer)
+  if (!binding) return
+  if (!sodium.crypto_sign_verify_detached(fromB64(data.sts_sig), binding, s.signPubKey)) {
+    log(`STS mismatch (complete) for ${fromPeer} — staying TOFU/eph-sig authenticated`)
+    return
   }
+  s.stsVerified = true
   log(`STS verified (responder): ${fromPeer}`)
 }
 
@@ -419,6 +395,26 @@ function verifySig(peerName: string, msg: any, sig64: string): boolean {
   }
 }
 
+// Build + sign + send an encrypted control/data frame. Single source of truth for
+// the on-wire envelope shape so every message type stays canonical-sign compatible.
+function sendCtrl(
+  target: string,
+  type: string,
+  enc: { encrypted: string; nonce: string },
+  extra?: Record<string, any>,
+): string {
+  const body: any = {
+    target, type,
+    encrypted: enc.encrypted, nonce: enc.nonce,
+    e2e: true, sender: PEER, session_id: sessionId,
+    payload: null, msg_id: makeMsgId(), seq: outboundSeq++,
+    ...extra,
+  }
+  body.sig = canonicalSign(body)
+  wsSend(body)
+  return body.msg_id
+}
+
 // ===========================================================================
 // REPLAY PROTECTION — persisted, write-ahead, session-scoped
 // ===========================================================================
@@ -444,11 +440,19 @@ function saveReplay(): void {
   safeWrite(REPLAY_FILE, JSON.stringify({ seen: obj, seqs: peerSeqs }))
 }
 
-// Write-ahead — persist msg_id BEFORE processing
-function writeAheadMsgId(msgId: string): void {
-  seenMsgIds.set(msgId, Date.now())
-  // Append to replay file immediately (crash-safe)
-  try { appendFileSync(REPLAY_FILE + '.wal', msgId + '\n') } catch {}
+// Dedup key is scoped to the SENDER so one peer cannot burn another peer's msg_id
+// namespace (the relay stamps `from` to the authenticated identity, so it is
+// unspoofable). This also makes write-ahead-before-verify safe: only the real sender
+// occupies its own key space and never reuses a msg_id.
+function seenKey(from: string, msgId: string): string {
+  return `${from}\0${msgId}`
+}
+
+// Write-ahead — persist BEFORE processing (crash-safe against reprocessing on restart)
+function writeAheadMsgId(from: string, msgId: string): void {
+  const key = seenKey(from, msgId)
+  seenMsgIds.set(key, Date.now())
+  try { appendFileSync(REPLAY_FILE + '.wal', key + '\n') } catch {}
 }
 
 function loadWAL(): void {
@@ -473,15 +477,18 @@ function checkReplay(
   let duplicate = false
 
   if (msgId) {
-    if (seenMsgIds.has(msgId)) duplicate = true
-    else writeAheadMsgId(msgId)
+    if (seenMsgIds.has(seenKey(from, msgId))) duplicate = true
+    else writeAheadMsgId(from, msgId)
   }
 
-  // Track max seq for persistence (ordering handled by reorder buffer)
+  // Enforce monotonic seq per (sender, session): a non-increasing seq is a replayed or
+  // reordered stale frame. Delivery is FIFO over one connection, so legitimate frames
+  // always advance. This is a real replay defense beyond the LRU/TTL-bounded msg_id set.
   if (typeof seq === 'number' && sid) {
     if (!peerSeqs[from]) peerSeqs[from] = {}
     const last = peerSeqs[from][sid] ?? -1
-    if (seq > last) peerSeqs[from][sid] = seq
+    if (seq <= last) duplicate = true
+    else peerSeqs[from][sid] = seq
   }
 
   return { duplicate }
@@ -502,73 +509,16 @@ const replayTimer = setInterval(() => {
 }, 10_000)
 
 // ===========================================================================
-// REORDER BUFFER — fixes out-of-order seq being dropped as replay
+// ORDERING
 // ===========================================================================
-
-interface BufferedMsg {
-  seq: number
-  msg: any
-  receivedAt: number
-}
-
-const reorderBuffers = new Map<string, BufferedMsg[]>()
-const expectedSeqs = new Map<string, number>()
-
-function reorderKey(peer: string, sid: string): string {
-  return `${peer}\0${sid}`
-}
-
-function bufferInsert(peer: string, sid: string, seq: number, msg: any): void {
-  const key = reorderKey(peer, sid)
-  let buf = reorderBuffers.get(key)
-  if (!buf) { buf = []; reorderBuffers.set(key, buf) }
-  buf.push({ seq, msg, receivedAt: Date.now() })
-  buf.sort((a, b) => a.seq - b.seq)
-}
-
-async function bufferFlush(peer: string, sid: string, processFn: (msg: any) => Promise<void>): Promise<void> {
-  const key = reorderKey(peer, sid)
-  const buf = reorderBuffers.get(key)
-  if (!buf || !buf.length) return
-
-  let expected = expectedSeqs.get(key) ?? 0
-
-  while (buf.length && buf[0].seq === expected) {
-    const item = buf.shift()!
-    expected++
-    await processFn(item.msg)
-  }
-
-  while (buf.length > 5) {
-    const item = buf.shift()!
-    expected = item.seq + 1
-    await processFn(item.msg)
-  }
-
-  expectedSeqs.set(key, expected)
-  if (!buf.length) reorderBuffers.delete(key)
-}
-
-function bufferForceFlushPeer(peer: string): void {
-  for (const [key] of reorderBuffers) {
-    if (key.startsWith(peer + '\0')) {
-      reorderBuffers.delete(key)
-      expectedSeqs.delete(key)
-    }
-  }
-}
-
-const reorderTimer = setInterval(() => {
-  const cutoff = Date.now() - 200
-  for (const [key, buf] of reorderBuffers) {
-    const stale = buf.filter(m => m.receivedAt < cutoff)
-    if (stale.length) {
-      const remaining = buf.filter(m => m.receivedAt >= cutoff)
-      if (remaining.length) reorderBuffers.set(key, remaining)
-      else reorderBuffers.delete(key)
-    }
-  }
-}, 100)
+//
+// A peer holds ONE active relay connection at a time (sequential failover), and the
+// relay forwards frames in receive order over a single TCP/WebSocket stream, so the
+// application stream is already FIFO. v0.1.x layered a seq-reorder buffer on top that
+// (a) assumed a contiguous-from-0 regular-message seq stream — false, because control
+// frames (_sts/_ack/_perm) share `outboundSeq` — and (b) silently DROPPED buffered
+// frames on a 200ms timer without ever delivering them. We deliver immediately in
+// arrival order; `msg_id` dedup + the signed `seq` field remain the replay defense.
 
 // ===========================================================================
 // E2E DELIVERY ACKS
@@ -591,9 +541,10 @@ function trackAck(msgId: string, target: string): void {
   pendingAcks.set(msgId, { target, timer })
 }
 
-function handleAck(ackMsgId: string): void {
+function handleAck(ackMsgId: string, fromPeer: string): void {
   const p = pendingAcks.get(ackMsgId)
-  if (p) {
+  // Only the peer the message was actually sent to may confirm its delivery.
+  if (p && p.target === fromPeer) {
     clearTimeout(p.timer)
     pendingAcks.delete(ackMsgId)
   }
@@ -602,16 +553,7 @@ function handleAck(ackMsgId: string): void {
 function sendAck(fromPeer: string, ackMsgId: string): void {
   const enc = encryptFor(fromPeer, `ack:${ackMsgId}`)
   if (!enc) return
-
-  const msgId = makeMsgId()
-  const ack: any = {
-    target: fromPeer, type: '_ack',
-    encrypted: enc.encrypted, nonce: enc.nonce,
-    e2e: true, sender: PEER, session_id: sessionId,
-    payload: null, msg_id: msgId, seq: outboundSeq++,
-  }
-  ack.sig = canonicalSign(ack)
-  wsSend(ack)
+  sendCtrl(fromPeer, '_ack', enc)
 }
 
 // ===========================================================================
@@ -741,11 +683,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
   switch (name) {
     case 'myc_send':
-      return { content: [{ type: 'text', text: sendEncrypted(args.target, args.text, args.type ?? 'info', args.target, args.request_id) }] }
+      return { content: [{ type: 'text', text: sendEncrypted(args.target, args.text, safeSendType(args.type), args.target, args.request_id) }] }
 
     case 'myc_broadcast': {
       if (!connectedPeers.length) return { content: [{ type: 'text', text: 'No peers' }] }
-      const results = connectedPeers.map(p => sendEncrypted(p, args.text, args.type ?? 'info', null, undefined))
+      // True N×unicast: each copy is routed to its specific recipient (target=p), so the
+      // relay delivers exactly one decryptable ciphertext per peer. Routing target=null
+      // would make the relay fan every per-recipient ciphertext to everyone, producing
+      // N-1 undecryptable copies per peer. Fire-and-forget: no per-recipient ack tracking.
+      const bType = safeSendType(args.type)
+      const results = connectedPeers.map(p => sendEncrypted(p, args.text, bType, p, undefined, false))
       return { content: [{ type: 'text', text: `Broadcast (${connectedPeers.length}): ${results.join('; ')}` }] }
     }
 
@@ -782,25 +729,34 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 })
 
-function sendEncrypted(target: string, text: string, msgType: string, routeTarget: string | null, requestId?: string): string {
+// Callers supply the message `type` from tool arguments (attacker-influenceable via
+// prompt injection of the local model). Restrict it to the public data types so a
+// caller cannot forge a reserved control frame (_sts_*/_ack/_perm_*) that a peer would
+// interpret as protocol traffic — e.g. a spoofed permission verdict.
+const ALLOWED_SEND_TYPES = new Set(['request', 'response', 'info', 'announcement'])
+function safeSendType(t: any): string {
+  return typeof t === 'string' && !t.startsWith('_') && ALLOWED_SEND_TYPES.has(t) ? t : 'info'
+}
+
+function sendEncrypted(
+  target: string,
+  text: string,
+  msgType: string,
+  routeTarget: string | null,
+  requestId?: string,
+  trackDelivery = true,
+): string {
   const s = peerSessions.get(target)
   if (!s) return `${target} 🔴BLOCKED`
 
   const enc = encryptFor(target, text)
   if (!enc) return `${target} ⚠️encrypt-failed`
 
-  const msgId = makeMsgId()
-  const seq = outboundSeq++
-  const body: any = {
-    target: routeTarget, type: msgType,
-    encrypted: enc.encrypted, nonce: enc.nonce,
-    e2e: true, sender: PEER, session_id: sessionId,
-    payload: null, msg_id: msgId, seq,
-  }
-  if (requestId) body.request_id = requestId
-  body.sig = canonicalSign(body)
-  wsSend(body)
-  if (routeTarget) trackAck(msgId, target)
+  const msgId = sendCtrl(target, msgType, enc, {
+    target: routeTarget,
+    ...(requestId ? { request_id: requestId } : {}),
+  })
+  if (routeTarget && trackDelivery) trackAck(msgId, target)
   return `${target} 🔒${s.tofuStatus === 'new' ? '🆕' : ''}`
 }
 
@@ -819,17 +775,7 @@ mcp.setNotificationHandler(PermReqSchema, async ({ params }) => {
   const payload = JSON.stringify(params)
   for (const peer of connectedPeers) {
     const enc = encryptFor(peer, payload)
-    if (!enc) continue
-    const msgId = makeMsgId()
-    const seq = outboundSeq++
-    const body: any = {
-      target: peer, type: '_perm_req',
-      encrypted: enc.encrypted, nonce: enc.nonce,
-      e2e: true, sender: PEER, session_id: sessionId,
-      payload: null, msg_id: msgId, seq,
-    }
-    body.sig = canonicalSign(body)
-    wsSend(body)
+    if (enc) sendCtrl(peer, '_perm_req', enc)
   }
 })
 
@@ -838,27 +784,22 @@ mcp.setNotificationHandler(PermReqSchema, async ({ params }) => {
 // ===========================================================================
 
 async function processRegularMessage(msg: any): Promise<void> {
-  // Hard block on bad/missing signature for E2E messages
-  if (msg.e2e) {
-    // sender field REQUIRED (no more !msg.sender bypass)
-    if (!msg.sender) { log(`🔴 BLOCKED: missing sender field from ${msg.from}`); return }
-    if (msg.sender !== msg.from) { log(`🔴 BLOCKED: sender/from mismatch: ${msg.sender} vs ${msg.from}`); return }
-    if (!msg.sig) { log(`🔴 BLOCKED: unsigned e2e message from ${msg.from}`); return }
-    if (!verifySig(msg.from, msg, msg.sig)) { log(`🔴 BLOCKED: bad signature from ${msg.from}`); return }
-  }
+  // Every legitimate peer message is E2E-encrypted AND signed. Anything else is a
+  // relay/attacker injection attempt — hard-block it rather than surfacing
+  // unauthenticated content to the model. v0.1.x delivered non-e2e frames verbatim,
+  // fully bypassing the "bad/missing sig = hard block" guarantee.
+  if (!msg.e2e) { log(`🔴 BLOCKED: non-E2E peer message from ${msg.from}`); return }
+  if (!msg.sender) { log(`🔴 BLOCKED: missing sender field from ${msg.from}`); return }
+  if (msg.sender !== msg.from) { log(`🔴 BLOCKED: sender/from mismatch: ${msg.sender} vs ${msg.from}`); return }
+  if (!msg.sig) { log(`🔴 BLOCKED: unsigned e2e message from ${msg.from}`); return }
+  if (!verifySig(msg.from, msg, msg.sig)) { log(`🔴 BLOCKED: bad signature from ${msg.from}`); return }
+  if (!msg.encrypted || !msg.nonce) { log(`🔴 BLOCKED: e2e message missing ciphertext from ${msg.from}`); return }
 
-  // Decrypt
-  let content: string
-  if (msg.e2e && msg.encrypted && msg.nonce) {
-    const dec = decryptFrom(msg.from, msg.encrypted, msg.nonce)
-    content = dec ?? `[⚠️ Decrypt failed from ${msg.from}]`
-  } else {
-    content = typeof msg.payload === 'string' ? msg.payload : JSON.stringify(msg.payload)
-  }
+  const content = decryptFrom(msg.from, msg.encrypted, msg.nonce)
+  if (content == null) { log(`🔴 BLOCKED: decrypt failed from ${msg.from}`); return }
 
   const session = peerSessions.get(msg.from)
   const tofu = session ? (session.tofuStatus === 'new' ? '🆕' : '🔒') : '🔴'
-  const sig = msg.e2e ? '✅' : (msg.sig ? '✅' : '❌unsigned')
 
   if (msg.msg_id && msg.from && msg.type !== '_ack') sendAck(msg.from, msg.msg_id)
 
@@ -868,7 +809,7 @@ async function processRegularMessage(msg: any): Promise<void> {
       content,
       meta: {
         from_peer: msg.from, type: msg.type ?? 'info', room: ROOM,
-        msg_id: msg.msg_id ?? '', e2e: msg.e2e ? 'encrypted' : 'plaintext', sig, tofu,
+        msg_id: msg.msg_id ?? '', e2e: 'encrypted', sig: '✅', tofu,
         ...(msg.request_id ? { request_id: msg.request_id } : {}),
       },
     },
@@ -984,6 +925,13 @@ function connectRelay(): void {
       reconnectAttempt = 0
       peerSessions.clear()
       pendingTrustKeys.clear()
+      // A new session (new sessionId + reset outboundSeq) invalidates prior per-session
+      // state. Clear stale timers so they can't fire spurious "delivery NOT confirmed"
+      // notifications or delete freshly-established STS state.
+      for (const [, p] of stsPending) clearTimeout(p.timer)
+      stsPending.clear()
+      for (const [, p] of pendingAcks) clearTimeout(p.timer)
+      pendingAcks.clear()
 
       if (msg.payload?.peers) {
         for (const [n, info] of Object.entries(msg.payload.peers) as [string, any][]) {
@@ -1071,7 +1019,7 @@ function connectRelay(): void {
     if (msg.type === '_ack') {
       if (msg.e2e && msg.encrypted && msg.nonce) {
         const dec = decryptFrom(msg.from, msg.encrypted, msg.nonce)
-        if (dec?.startsWith('ack:')) handleAck(dec.slice(4))
+        if (dec?.startsWith('ack:')) handleAck(dec.slice(4), msg.from)
       }
       return
     }
@@ -1086,7 +1034,7 @@ function connectRelay(): void {
       const dec = decryptFrom(msg.from, msg.encrypted, msg.nonce)
       if (!dec) return
 
-      if (msg.type === '_sts_init') handleSTSInit(msg.from, dec)
+      if (msg.type === '_sts_init') handleSTSInit(msg.from)
       else if (msg.type === '_sts_reply') handleSTSReply(msg.from, dec)
       else if (msg.type === '_sts_complete') handleSTSComplete(msg.from, dec)
       return
@@ -1137,12 +1085,7 @@ function connectRelay(): void {
     const { duplicate } = checkReplay(msg.from, msg.msg_id, msg.seq, msg.session_id)
     if (duplicate) { log(`Replay BLOCKED: dup ${msg.msg_id}`); return }
 
-    if (typeof msg.seq === 'number' && msg.session_id) {
-      bufferInsert(msg.from, msg.session_id, msg.seq, msg)
-      await bufferFlush(msg.from, msg.session_id, processRegularMessage)
-    } else {
-      await processRegularMessage(msg)
-    }
+    await processRegularMessage(msg)
   })
 
   ws.addEventListener('close', (e) => {
@@ -1214,7 +1157,6 @@ async function safeNotify(n: any): Promise<void> {
   function cleanup(): void {
     saveReplay()
     clearInterval(replayTimer)
-    clearInterval(reorderTimer)
     if (reconnectTimer) clearTimeout(reconnectTimer)
     stopHB()
     for (const [, p] of pendingAcks) clearTimeout(p.timer)

@@ -1,9 +1,8 @@
 {
   "name": "@yoda.digital/mycelium",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "End-to-end encrypted messaging between Claude Code instances. Curve25519 PFS, Ed25519 TOFU, replay protection, stateless relay.",
   "type": "module",
-  "main": "build/peer-channel.js",
   "bin": {
     "mycelium-peer": "build/peer-channel.js",
     "mycelium-relay": "build/relay.js"
@@ -24,8 +23,11 @@
     "bun": ">=1.3.5"
   },
   "scripts": {
-    "build": "bun build relay.ts peer-channel.ts --outdir build --target bun --banner '#!/usr/bin/env bun' && chmod +x build/relay.js build/peer-channel.js",
-    "test": "bun run test.ts",
+    "build": "bun build relay.ts peer-channel.ts --outdir build --target bun && chmod +x build/relay.js build/peer-channel.js",
+    "prepublishOnly": "bun run build && bun run typecheck",
+    "test": "bun run test.ts && bun run test-integration.ts",
+    "test:unit": "bun run test.ts",
+    "test:integration": "bun run test-integration.ts",
     "typecheck": "bunx tsc --noEmit",
     "relay": "bun run relay.ts",
     "peer": "bun run peer-channel.ts"

@@ -136,9 +136,10 @@ Each Claude Code instance that participates needs the MCP server configured.
 
 ```bash
 # Claude Code reads MCP config from:
-~/.claude/claude_desktop_config.json    # desktop app
-# or project-level:
-.mcp.json                               # in project root
+~/.claude.json          # user (global) scope
+.mcp.json               # project scope, in the repo root
+# Easiest is the CLI, which writes the JSON below for you:
+#   claude mcp add-json mycelium '{"command":"bun","args":["/abs/path/peer-channel.ts"],"env":{...}}'
 ```
 
 ### Add Mycelium

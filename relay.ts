@@ -23,6 +23,15 @@ import { homedir } from 'os'
 const toB64 = (x: Uint8Array) => sodium.to_base64(x, sodium.base64_variants.ORIGINAL)
 const fromB64 = (x: string) => sodium.from_base64(x, sodium.base64_variants.ORIGINAL)
 
+// Constant-time, length-independent secret comparison (both sides hashed, then memcmp).
+// Prevents byte-by-byte timing discrimination on the shared token / bearer credential.
+function ctEq(a: string | null | undefined, b: string): boolean {
+  if (a == null) return false
+  const ha = sodium.crypto_hash(sodium.from_string(a))
+  const hb = sodium.crypto_hash(sodium.from_string(b))
+  return sodium.memcmp(ha, hb)
+}
+
 const PORT = Number(process.env.RELAY_PORT ?? 9900)
 const TOKEN = process.env.RELAY_TOKEN
 const MAX_PEERS = Number(process.env.RELAY_MAX_PEERS ?? 50)
@@ -99,13 +108,16 @@ function queueKey(room: string, peer: string): string {
   return `${room}\0${peer}`
 }
 
-function resolveIp(req: Request): string {
+function resolveIp(req: Request, server: any): string {
   if (TRUSTED_PROXY) {
     return req.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
       ?? req.headers.get('x-real-ip')
       ?? 'direct'
   }
-  return 'direct'
+  // Real per-source limiting requires the socket address. v0.1.x returned a constant
+  // 'direct' for every non-proxied client, collapsing RELAY_MAX_IP_CONNS into a single
+  // GLOBAL connection cap (default 10) instead of a per-IP limit.
+  return server.requestIP(req)?.address ?? 'direct'
 }
 
 function removePeer(peer: Peer): void {
@@ -168,7 +180,9 @@ function makeMsgId(): string {
 }
 
 // Fair-share uses active peers count, minimum 3
-function enqueue(room: string, targetPeer: string, senderPeer: string, data: string): void {
+// Returns true if the message was actually queued, false if a cap discarded it — so the
+// caller can tell the sender the truth instead of an unconditional "queued".
+function enqueue(room: string, targetPeer: string, senderPeer: string, data: string): boolean {
   const key = queueKey(room, targetPeer)
   let q = offlineQueues.get(key)
   if (!q) {
@@ -177,14 +191,15 @@ function enqueue(room: string, targetPeer: string, senderPeer: string, data: str
   }
 
   const totalSize = q.reduce((s, m) => s + m.size, 0)
-  if (q.length >= QUEUE_MAX_MSGS || totalSize + data.length > QUEUE_MAX_BYTES) return
+  if (q.length >= QUEUE_MAX_MSGS || totalSize + data.length > QUEUE_MAX_BYTES) return false
 
   const activePeers = getPeersInRoom(room).size || 1
   const perSenderMax = Math.max(3, Math.ceil(QUEUE_MAX_MSGS / activePeers))
-  if (q.filter(m => m.sender === senderPeer).length >= perSenderMax) return
+  if (q.filter(m => m.sender === senderPeer).length >= perSenderMax) return false
 
   q.push({ data, size: data.length, expiresAt: Date.now() + QUEUE_TTL_S * 1000, sender: senderPeer })
   msgQueued++
+  return true
 }
 
 function drainQueue(peer: Peer): void {
@@ -330,13 +345,13 @@ function broadcast(room: string, sender: string, msg: any): void {
   loadAllowList()
   log('info', 'relay_identity', { fingerprint: relayFingerprint(relayKeys.publicKey) })
 
-const server = Bun.serve({
+const server = Bun.serve<WsData>({
   port: PORT,
   fetch(req, server) {
     const url = new URL(req.url)
 
     if (url.pathname === '/health') {
-      if (req.headers.get('authorization') !== `Bearer ${TOKEN}`) {
+      if (!ctEq(req.headers.get('authorization'), `Bearer ${TOKEN}`)) {
         return new Response('unauthorized', { status: 401 })
       }
       const m = process.memoryUsage()
@@ -355,7 +370,7 @@ const server = Bun.serve({
       return new Response('TLS required', { status: 421 })
     }
 
-    const ip = resolveIp(req)
+    const ip = resolveIp(req, server)
     if ((ipConnections.get(ip) ?? 0) >= MAX_IP_CONNS) {
       return new Response('too many connections', { status: 429 })
     }
@@ -468,10 +483,10 @@ const server = Bun.serve({
                 const curvePk = sodium.crypto_sign_ed25519_pk_to_curve25519(relayKeys.publicKey)
                 const curveSk = sodium.crypto_sign_ed25519_sk_to_curve25519(relayKeys.privateKey)
                 const decrypted = sodium.crypto_box_seal_open(fromB64(msg.sealed_token), curvePk, curveSk)
-                tokenValid = sodium.to_string(decrypted) === TOKEN
+                tokenValid = ctEq(sodium.to_string(decrypted), TOKEN!)
               } catch {}
             } else if (msg.token) {
-              tokenValid = msg.token === TOKEN
+              tokenValid = ctEq(msg.token, TOKEN!)
             }
 
             if (!tokenValid) {
@@ -489,7 +504,7 @@ const server = Bun.serve({
             ws.close(4005, 'challenge required')
             return
           }
-          if (msg.token !== TOKEN) {
+          if (!ctEq(msg.token, TOKEN!)) {
             ws.send(JSON.stringify({ type: 'auth_error', from: '_relay', payload: 'invalid token' }))
             ws.close(4005, 'bad token')
             return
@@ -497,7 +512,7 @@ const server = Bun.serve({
           if (!known) addToAllowList(room, msg.sign_pubkey)
         }
 
-        const rp = getPeersInRoom(room)
+        let rp = getPeersInRoom(room)
 
         // Identity-bound eviction
         const existing = rp.get(msg.peer)
@@ -520,6 +535,10 @@ const server = Bun.serve({
             existing.ws.close(4020, 'superseded')
           } catch {}
           removePeer(existing)
+          // removePeer deletes the room map when it empties (sole-member reconnect),
+          // which would orphan `rp`. Re-acquire so we register the new peer in the
+          // live room map instead of a detached one.
+          rp = getPeersInRoom(room)
         }
 
         if (rp.size >= MAX_PEERS) {
@@ -585,10 +604,19 @@ const server = Bun.serve({
       if (msg.target) {
         const t = getPeersInRoom(d.room).get(msg.target)
         if (t) {
-          t.ws.send(JSON.stringify(msg))
+          // send() returns 0 when the socket is over its backpressure limit and the frame
+          // was NOT buffered — tell the sender instead of dropping it silently.
+          if (t.ws.send(JSON.stringify(msg)) === 0) {
+            log('warn', 'unicast_backpressure_drop', { from: d.name, target: msg.target })
+            ws.send(JSON.stringify({ type: 'error', from: '_relay', payload: `${msg.target} backpressured; message dropped`, msg_id: msg.msg_id }))
+          }
         } else {
-          enqueue(d.room, msg.target, d.name, JSON.stringify(msg))
-          ws.send(JSON.stringify({ type: 'queued', from: '_relay', payload: `${msg.target} offline`, msg_id: msg.msg_id }))
+          const queued = enqueue(d.room, msg.target, d.name, JSON.stringify(msg))
+          ws.send(JSON.stringify({
+            type: queued ? 'queued' : 'error', from: '_relay',
+            payload: queued ? `${msg.target} offline` : `${msg.target} offline; queue full, message dropped`,
+            msg_id: msg.msg_id,
+          }))
         }
       } else {
         broadcast(d.room, d.name, msg)
