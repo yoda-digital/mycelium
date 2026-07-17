@@ -65,7 +65,10 @@ real two-peer end-to-end test coverage whose absence let the regression ship gre
   id regardless of sender; it now requires the ack to come from the message's target.
 - **`msg_id` dedup was globally keyed and seq was never enforced.** Dedup is now scoped
   to the (unspoofable) sender so one peer can't burn another's `msg_id` namespace, and
-  the signed `seq` is enforced monotonic per session as a real replay defense.
+  the signed `seq` is enforced monotonic per session as a real replay defense. Both are
+  consulted and committed **only after signature verification**, so a malicious relay
+  cannot inject a forged high-seq frame to poison the monotonic floor and silently drop
+  the real sender's future messages.
 - **relay lied about queued/dropped messages.** A unicast dropped under backpressure,
   or an offline message discarded by a queue cap, is now reported to the sender instead
   of silently dropped / falsely reported as `queued`.
@@ -83,8 +86,12 @@ real two-peer end-to-end test coverage whose absence let the regression ship gre
 - **`test-integration.ts` — real end-to-end suite.** Spawns a relay and two actual
   `peer-channel.ts` MCP processes and asserts genuine delivery: STS mutual
   verification, unicast/broadcast each deliver exactly one decrypted copy, bidirectional
-  reply, a 20-message burst delivered in order with no drops, and `myc_peers` status.
-  `bun test` now runs both the protocol/unit suite and this integration suite.
+  reply, a 20-message burst delivered in order with no drops, `myc_peers` status, and a
+  hard-blocked plaintext-injection attempt.
+- **`test-replay-poison.ts` — malicious-relay regression test.** Runs a real
+  `peer-channel.ts` against a mock relay that forges a bad-signature high-seq frame, and
+  asserts a subsequent legitimate low-seq message is still delivered (the seq floor is
+  not poisoned). `bun run test` runs the unit, integration, and this suite.
 
 ### Changed
 

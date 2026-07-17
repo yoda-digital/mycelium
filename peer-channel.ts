@@ -795,6 +795,13 @@ async function processRegularMessage(msg: any): Promise<void> {
   if (!verifySig(msg.from, msg, msg.sig)) { log(`🔴 BLOCKED: bad signature from ${msg.from}`); return }
   if (!msg.encrypted || !msg.nonce) { log(`🔴 BLOCKED: e2e message missing ciphertext from ${msg.from}`); return }
 
+  // Replay/seq state is consulted + committed ONLY AFTER the frame is authenticated.
+  // The monotonic `seq` is a threshold, not a set: consuming it pre-verification would
+  // let a malicious relay inject a forged high-seq frame (rejected for bad sig, invisibly)
+  // that ratchets the floor and permanently drops the real sender's future messages.
+  const { duplicate } = checkReplay(msg.from, msg.msg_id, msg.seq, msg.session_id)
+  if (duplicate) { log(`Replay BLOCKED: dup/stale-seq ${msg.msg_id} from ${msg.from}`); return }
+
   const content = decryptFrom(msg.from, msg.encrypted, msg.nonce)
   if (content == null) { log(`🔴 BLOCKED: decrypt failed from ${msg.from}`); return }
 
@@ -1082,9 +1089,8 @@ function connectRelay(): void {
     }
 
     // --- REGULAR PEER MESSAGE ---
-    const { duplicate } = checkReplay(msg.from, msg.msg_id, msg.seq, msg.session_id)
-    if (duplicate) { log(`Replay BLOCKED: dup ${msg.msg_id}`); return }
-
+    // Replay/seq state is consulted INSIDE processRegularMessage, AFTER signature
+    // verification, so an unauthenticated forged frame can't poison the seq floor.
     await processRegularMessage(msg)
   })
 

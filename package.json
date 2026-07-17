@@ -25,9 +25,10 @@
   "scripts": {
     "build": "bun build relay.ts peer-channel.ts --outdir build --target bun && chmod +x build/relay.js build/peer-channel.js",
     "prepublishOnly": "bun run build && bun run typecheck",
-    "test": "bun run test.ts && bun run test-integration.ts",
+    "test": "bun run test.ts && bun run test-integration.ts && bun run test-replay-poison.ts",
     "test:unit": "bun run test.ts",
     "test:integration": "bun run test-integration.ts",
+    "test:poison": "bun run test-replay-poison.ts",
     "typecheck": "bunx tsc --noEmit",
     "relay": "bun run relay.ts",
     "peer": "bun run peer-channel.ts"
