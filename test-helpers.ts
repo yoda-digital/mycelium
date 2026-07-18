@@ -18,6 +18,9 @@ export interface PeerProcOpts {
   filePrefix?: string
   /** Additional env (MYC_RELAY_FINGERPRINT, MYC_KEY_PASSPHRASE, …). */
   extraEnv?: Record<string, string>
+  /** Override the spawn command (default: bun run peer-channel.ts). Lets a test run
+   *  the NODE-target build under `node` to prove cross-runtime portability. */
+  cmd?: string[]
 }
 
 export class PeerProc {
@@ -32,7 +35,7 @@ export class PeerProc {
   constructor(opts: PeerProcOpts) {
     this.name = opts.name
     const prefix = opts.filePrefix ?? opts.name
-    this.proc = Bun.spawn(['bun', 'run', 'peer-channel.ts'], {
+    this.proc = Bun.spawn(opts.cmd ?? ['bun', 'run', 'peer-channel.ts'], {
       cwd: import.meta.dir,
       env: {
         ...process.env,
