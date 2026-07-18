@@ -19,8 +19,17 @@ function assert(cond: boolean, name: string): void {
   else { failed++; console.error(`  ❌ ${name}`) }
 }
 
-function makeAuth(name: string, room = 'default') {
-  const signKP = sodium.crypto_sign_keypair()
+// The relay now PERSISTENTLY binds a name to its Ed25519 key (allow-list v2),
+// so a test name must keep one identity for the whole run. `freshIdentity`
+// deliberately mints a different key — for tests asserting the binding rejects it.
+const signKPCache = new Map<string, any>()
+
+function makeAuth(name: string, room = 'default', freshIdentity = false) {
+  let signKP = freshIdentity ? null : signKPCache.get(name)
+  if (!signKP) {
+    signKP = sodium.crypto_sign_keypair()
+    if (!freshIdentity) signKPCache.set(name, signKP)
+  }
   const ephKP = sodium.crypto_box_keypair()
   const ephSig = sodium.crypto_sign_detached(ephKP.publicKey, signKP.privateKey)
   const sid = sodium.randombytes_buf(16).reduce((s: string, b: number) => s + b.toString(16).padStart(2, '0'), '')
@@ -324,7 +333,7 @@ try {
   console.log('\n🔐 T14: Identity-bound eviction REJECTS different key')
   const lw3Auth = makeAuth('id-test')
   const lw3 = await connectPeer('id-test', 'default', { authOverride: lw3Auth })
-  const diffAuth = makeAuth('id-test') // different key!
+  const diffAuth = makeAuth('id-test', 'default', true) // different key!
   try {
     await connectPeer('id-test', 'default', { authOverride: diffAuth })
     assert(false, 'should reject different key')
@@ -626,6 +635,81 @@ try {
     assert(stsInitMsg.e2e === true, 'L5: STS init is E2E encrypted')
     assert(typeof stsInitMsg.sig === 'string', 'L5: STS init is signed')
     assert(stsInitMsg.type === '_sts_init', 'L5: STS init type correct')
+  }
+
+  console.log('\n=== v2 canonical: conditional fields are strip/add-safe ===')
+  {
+    const kp = sodium.crypto_sign_keypair()
+    const v2 = {
+      e2e: true, encrypted: 'e', msg_id: 'm', nonce: 'n', offline: true, payload: null,
+      proto: 2, request_id: null, room: 'ops', sender: 'a', seq: null, session_id: null,
+      target: 'b', ts: 1234567890, type: 'info',
+    }
+    const sig = sodium.crypto_sign_detached(sodium.from_string(canonicalize(v2)), kp.privateKey)
+    assert(sodium.crypto_sign_verify_detached(sig, sodium.from_string(canonicalize(v2)), kp.publicKey), 'v2 frame verifies')
+    const { room, ...stripped } = v2 as any
+    assert(!sodium.crypto_sign_verify_detached(sig, sodium.from_string(canonicalize(stripped)), kp.publicKey), 'STRIPPING room breaks the sig (no cross-room re-route)')
+    const { ts, ...noTs } = v2 as any
+    assert(!sodium.crypto_sign_verify_detached(sig, sodium.from_string(canonicalize(noTs)), kp.publicKey), 'STRIPPING ts breaks the sig (no freshness laundering)')
+    const legacy = {
+      e2e: true, encrypted: 'e', msg_id: 'm', nonce: 'n', payload: null, request_id: null,
+      sender: 'a', seq: 0, session_id: 's', target: 'b', type: 'info',
+    }
+    const legacySig = sodium.crypto_sign_detached(sodium.from_string(canonicalize(legacy)), kp.privateKey)
+    assert(sodium.crypto_sign_verify_detached(legacySig, sodium.from_string(canonicalize(legacy)), kp.publicKey), 'legacy 11-field frame still verifies (back-compat)')
+    assert(!sodium.crypto_sign_verify_detached(legacySig, sodium.from_string(canonicalize({ ...legacy, ts: 999 })), kp.publicKey), 'ADDING ts to a legacy frame breaks the sig')
+  }
+
+  console.log('\n=== Name binding: offline name-squatting is rejected ===')
+  {
+    // v0.2.x only checked the LIVE room map, so an offline peer's name could be
+    // squatted by any other allow-listed key. The persistent binding closes this.
+    const owner = await connectPeer('squat-victim')
+    owner.close()
+    await Bun.sleep(300)
+    try {
+      await connectPeer('squat-victim', 'default', { authOverride: makeAuth('squat-victim', 'default', true) })
+      assert(false, 'squat should be rejected')
+    } catch (e: any) {
+      assert(/bound to different identity/.test(e.message), 'OFFLINE name squat rejected by persistent binding')
+    }
+  }
+
+  console.log('\n=== Admin revoke: blocklists the key, undo restores ===')
+  {
+    const victimKey = toB64(signKPCache.get('squat-victim').publicKey)
+    const rev = await fetch(`http://127.0.0.1:${PORT}/admin/revoke`, {
+      method: 'POST', headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ room: 'default', name: 'squat-victim' }),
+    })
+    assert(rev.status === 200 && ((await rev.json()) as any).revoked === true, 'revoke by name succeeds')
+    try {
+      await connectPeer('squat-victim')
+      assert(false, 'revoked key must not reconnect')
+    } catch (e: any) {
+      assert(/revoked/.test(e.message), 'revoked key rejected even with a valid token')
+    }
+    const undo = await fetch(`http://127.0.0.1:${PORT}/admin/revoke`, {
+      method: 'POST', headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ room: 'default', pubkey: victimKey, undo: true }),
+    })
+    assert(undo.status === 200 && ((await undo.json()) as any).revoked === true, 'undo removes the blocklist entry')
+    const back = await connectPeer('squat-victim')
+    assert(back.readyState === WebSocket.OPEN, 'un-revoked key re-registers with the token')
+    back.close()
+    const noAuth = await fetch(`http://127.0.0.1:${PORT}/admin/revoke`, { method: 'POST', body: '{}' })
+    assert(noAuth.status === 401, 'admin endpoints require the bearer token')
+  }
+
+  console.log('\n=== Room discovery: list_rooms over the authenticated channel ===')
+  {
+    const d1 = await connectPeer('disc-test')
+    const reply = waitMsg(d1, 3000)
+    d1.send(JSON.stringify({ type: 'list_rooms' }))
+    const rooms = await reply
+    assert(rooms.type === 'rooms' && Array.isArray(rooms.payload?.rooms), 'relay answers list_rooms')
+    assert(rooms.payload.rooms.some((r: any) => r.name === 'default' && Array.isArray(r.members)), 'member room includes peer names')
+    d1.close()
   }
 
   relay.kill('SIGTERM')

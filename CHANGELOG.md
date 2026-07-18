@@ -9,6 +9,133 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Nothing yet. New entries land here between releases._
 
+## [0.3.0] - 2026-07-18
+
+Completeness release (wire protocol v2). A full audit of v0.2.1 against the
+project's own philosophy found one architectural hole (offline delivery was
+impossible by construction), several designed-but-never-shipped features, and a
+threat-model overstatement. This release closes all of them. Mixed-version
+rooms: 0.3.0 peers verify 0.2.x frames, but 0.2.x peers cannot verify 0.3.0
+frames (new signed fields) — upgrade all peers together.
+
+### Fixed
+
+- **ARCHITECTURAL — offline delivery actually works now.** v0.2.x relay-queued
+  session frames were encrypted to ephemeral keys that rotate on reconnect, so
+  100% of queued frames arrived undecryptable — the queue could only ever
+  produce nack/resend theater. Messages to an offline (TOFU-known) peer are now
+  sealed to the recipient's **identity-derived Curve25519 key**
+  (`crypto_box_seal`), which survives reconnects. Tradeoff, documented: offline
+  envelopes have **no PFS** (live-session traffic keeps it). Authenticity comes
+  from the canonical Ed25519 envelope signature verified against the pinned
+  sender key; replay is bounded by a **signed `ts` freshness window**
+  (`MYC_OFFLINE_MAX_AGE_S`, default 1h) plus persisted msg_id dedup whose
+  retention outlives the window. Session frames are marked `no_queue` so the
+  relay fails them fast instead of queueing guaranteed decrypt failures; the
+  sender then re-sends as an envelope automatically. First contact still
+  requires both peers online (TOFU needs a pin to seal to).
+- **Threat-model overstatement — name binding is now persistent.** The README
+  claimed "different key claiming same name = rejected", but the relay only
+  checked the LIVE room map: an offline peer's name could be squatted by anyone
+  allow-listed. The allow-list (v2 format, auto-migrated) now stores a
+  persistent name↔key binding per room, enforced in both directions
+  (name→key and key→name), online or offline.
+- **Detection without recovery — retransmission is automatic and idempotent.**
+  v0.2.x told the *model* to resend (the least reliable component in the
+  system). Every tracked send now lives in an outbox; nacks, relay-reported
+  drops, ack timeouts, peer reappearance, and relay reconnects all trigger
+  automatic retransmission **with the same msg_id** (receivers dedup and
+  re-ack verified duplicates, so lost acks can't cause double delivery).
+  Decrypt-failure msg_ids are no longer committed pre-decryption, so a
+  same-id retransmission is accepted instead of dedup-dropped — the v0.2.x
+  nack loop could never actually recover because of exactly this. The model
+  hears about a send again only on confirmed delivery of a deferred message or
+  terminal failure (after `RETRY_MAX` attempts). Sends while the relay is down
+  queue locally and flush on reconnect.
+
+### Added
+
+- **`myc_recv` — host-independent inbox.** Every delivery (and system event) is
+  buffered in a 500-entry inbox that `myc_recv` drains, so Mycelium works on
+  MCP hosts that do not surface the experimental `notifications/claude/channel`
+  capability. Previously such hosts could send but never read.
+- **Broadcast is first-class:** each copy is ack-tracked and auto-retransmitted
+  like a unicast; `include_offline: true` also reaches TOFU-known offline peers
+  via identity envelopes (same-identity peers deduplicated across rooms).
+- **Key rotation (`myc_rotate_key`).** Generates a new Ed25519 identity and
+  announces `sign(newPub || name || ts, oldKey)` to every known peer — live
+  sessions now, offline envelopes for the absent — who verify it against their
+  *currently pinned* key and update pins with no TOFU violation. The relay
+  migrates the name binding from the same continuity statement presented at
+  re-auth (challenge-signed with the new key). Old-announcement replays cannot
+  roll pins back (the signer must be the currently-pinned key).
+- **Revocation tooling.** `POST /admin/revoke {room, name|pubkey}` (bearer:
+  relay token) removes the binding, **blocklists the key** (a revoked key
+  cannot re-register itself with the long-lived invite token), and disconnects
+  the live peer; `{undo: true}` un-revokes. `GET /admin/allowlist` inspects
+  bindings. Replaces "edit the JSON by hand".
+- **Multi-room membership + discovery.** `MYC_ROOM` takes a comma list (≤8);
+  one connection serves all rooms; frames carry a **signed `room`** so the
+  relay cannot re-route a message across rooms; sessions, TOFU pins, replay
+  windows, STS bindings, and acks are all room-scoped. `myc_rooms` lists rooms
+  via the relay (`RELAY_DISCOVERY=false` to disable; non-member rooms show
+  counts only).
+- **Chunking.** Logical messages up to `MYC_MAX_MSG_BYTES` (default 1MB) are
+  split into ≤24KB parts that inherit signatures, acks, dedup, and
+  retransmission; receivers reassemble after decryption (chunk metadata rides
+  inside the authenticated ciphertext). The 64KB relay frame cap no longer
+  bounds message size.
+- **Multi-relay fingerprint pinning.** `MYC_RELAY_FINGERPRINT` accepts a comma
+  list matched as a set, so failover composes with identity pinning — v0.2.x
+  docs told operators to *disable pinning* to use failover. Pinning configured
+  + relay presents no identity → fail closed; token sealing failure with
+  pinning configured no longer downgrades to a plaintext token.
+- **Passphrase-encrypted key files.** `MYC_KEY_PASSPHRASE` /
+  `RELAY_KEY_PASSPHRASE` encrypt identity keys at rest (Argon2id via
+  `crypto_pwhash` + `crypto_secretbox`); plaintext files upgrade in place on
+  first run; wrong passphrase is fail-closed.
+- **Wire protocol version (`proto: 2`)** in challenge/auth/auth_ok and on every
+  frame (signed, presence-conditional). Signature failures against a
+  mismatched `proto` log an explicit upgrade hint instead of a bare bad-sig.
+- **`_perm_req` is ack-tracked** (approval requests were the one message class
+  still able to vanish silently); verdicts keep their acks.
+- **Room-scoped TOFU (v2 store, auto-migrated)** — same-named peers in
+  different rooms no longer collide into spurious violations.
+- **CI on every push/PR** (`tests.yml`): blocking typecheck + all three suites.
+  Publish-time typecheck is blocking too (was `continue-on-error`).
+- Tests: 176 across three suites (89 unit/relay, 63 two-peer integration, 24
+  controlled-relay), covering every feature above end-to-end — including the
+  offline-delivery walk with a real process restart, the nack→auto-resend→
+  confirm loop, rotation continuity, offline name-squat rejection, revoke/undo,
+  chunk reassembly byte-identity, and passphrase fail-closed.
+
+### Changed
+
+- Canonical signature v2: `offline`, `proto`, `room`, `ts` join the signed
+  fields with presence-conditional inclusion — stripping or adding any of them
+  breaks the signature, and legacy 11-field frames still verify (see
+  `canonical.ts`).
+- Verified duplicates are **re-acked** (lost-ack recovery) instead of silently
+  dropped; replay commits happen only after signature verification AND
+  successful decryption.
+- Relay `queued` status is log-only at the sender (the model was already told
+  📮 at send time); relay `error` reports feed the retransmission loop and
+  only surface for untracked messages.
+- `myc_peers` shows per-room status, offline-reachable peers, inbox depth, and
+  local-queue state; MCP server version now tracks the package version.
+
+### Known limitations (honest edition)
+
+- Offline envelopes trade PFS for deliverability (documented above); live
+  sessions keep full PFS.
+- First contact requires both peers online (sealing needs a pinned identity).
+- The relay still sees metadata: names, rooms, timing, sizes, and the
+  who-talks-to-whom graph. Traffic analysis is NOT mitigated — see README
+  threat model.
+- Revoking a key frees its name; a revoked *operator* holding the invite token
+  can re-register under a fresh name/key. Rotate `RELAY_TOKEN` to fully evict
+  an actor.
+
 ## [0.2.1] - 2026-07-18
 
 Loss-signal release. A post-merge audit of 0.2.0 confirmed that several of its

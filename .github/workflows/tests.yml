@@ -1,0 +1,33 @@
+name: Tests
+
+# The v0.1.x lesson: a total delivery failure shipped green because the real
+# two-peer integration suite did not exist — and later, because tests only ran
+# at publish time. This workflow gates every push and PR on the full suite.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install deps (frozen lockfile)
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck (blocking)
+        run: bunx tsc --noEmit
+
+      - name: Unit + integration + controlled-relay suites
+        run: bun run test

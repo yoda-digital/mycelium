@@ -1,5 +1,25 @@
 # Mycelium v5 — encrypted nerve network for Claude Code instances
 
+> **⚠️ HISTORICAL DOCUMENT (v5-era, pre-0.2.0).** Preserved as the audit trail of
+> the original hardening debates. Several claims below no longer describe the
+> shipped protocol:
+>
+> - The **seq reorder buffer** (L3) was REMOVED in 0.2.0 — it silently dropped
+>   messages. Ordering now relies on single-connection FIFO + an RFC 4303-style
+>   signed-seq window (0.2.1) with re-ack on verified duplicates (0.3.0).
+> - The relay is **not stateless**: it keeps offline queues, persistent
+>   name↔key bindings (+ revocation blocklist), and connection bookkeeping.
+> - "STS auth failed → BLOCK" was refined in 0.2.x: signature mismatch is
+>   fail-closed, timeout is lenient.
+> - Line counts and test counts are v5-era; see the top-level README.
+> - 0.3.0 added what v5 deferred or missed entirely: working offline delivery
+>   (identity envelopes), automatic idempotent retransmission, persistent name
+>   binding, key rotation, revocation tooling, multi-room, chunking, an inbox
+>   fallback, and honest metadata documentation.
+>
+> The current protocol description lives in the top-level `README.md` and
+> `CHANGELOG.md`.
+
 E2E encrypted. PFS. TOFU fail-closed. Signature-enforced. Replay-proof. Delivery-confirmed. 25 vulnerabilities found and fixed across 3 adversarial multi-model debates.
 
 ## What a compromised relay CANNOT do

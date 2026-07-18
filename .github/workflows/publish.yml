@@ -67,10 +67,7 @@ jobs:
           fi
           echo "Tag and package.json version both = $PKG"
 
-      # Typecheck is a non-blocking signal — the existing source predates
-      # the tsconfig and has known strict-mode warnings. Build is the gate.
-      - name: Typecheck (non-blocking)
-        continue-on-error: true
+      - name: Typecheck (blocking — strict passes since 0.2.0)
         run: bunx tsc --noEmit
 
       - name: Build (bun → build/)

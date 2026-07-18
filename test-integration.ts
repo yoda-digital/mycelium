@@ -178,6 +178,16 @@ try {
   await Bun.sleep(600) // let the relay reap bob and alice process peer_left
   const stsBefore = alice.stderr.filter(l => /STS verified: bob/.test(l)).length
   alice.clear()
+  // The relay's persistent name binding would (correctly) reject a fresh key for
+  // "bob" — the operator recovery path is an admin revoke, which frees the name
+  // and blocklists the lost key. This is the real "peer lost its keys" flow.
+  const revokeRes = await fetch(`http://127.0.0.1:${PORT}/admin/revoke`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ room: 'default', name: 'bob' }),
+  })
+  const revokeJson: any = await revokeRes.json()
+  assert(revokeRes.status === 200 && revokeJson.revoked === true, 'admin revoke frees the name binding')
   bob2 = spawnPeer('bob', 'bob2') // same name, fresh keys → TOFU 'changed' at alice
   await bob2.initialize()
   assert(await waitUntil(() => alice.stderrHas(/TOFU VIOLATION: bob/), 6000), 'alice detects the key change (TOFU violation)')
@@ -194,6 +204,130 @@ try {
   bob2.clear()
   await alice.callTool('myc_send', { target: 'bob', text: 'POST-TRUST', type: 'info' })
   assert(await waitUntil(() => bob2!.from('alice').some(m => m.content === 'POST-TRUST'), 3000), 'delivery works after trust')
+
+  console.log('\n📮 IT12: OFFLINE delivery — send to a dead peer, it receives on return')
+  // The v0.2.x architectural hole: relay-queued session frames were undecryptable
+  // by construction (keys rotate on reconnect). v0.3.0 seals offline messages to
+  // the recipient's IDENTITY key, so store-and-forward actually works.
+  bob2.kill()
+  assert(await waitUntil(() => alice.stderrHas(/Disconnected|peer_left/) || !alice.from('bob').length || true, 500) && await waitUntil(() => (alice.channelMsgs.some(m => m.meta?.type === 'peer_left' && m.meta?.peer === 'bob')), 6000), 'alice saw bob leave')
+  alice.clear()
+  const offRes = alice.toolText(await alice.callTool('myc_send', { target: 'bob', text: 'WHILE-YOU-WERE-OUT', type: 'info' }))
+  assert(offRes.includes('📮'), `send to offline peer becomes an identity envelope (${offRes.trim()})`)
+  await Bun.sleep(400)
+  const bob3 = spawnPeer('bob', 'bob2') // SAME identity as the trusted bob2
+  bob2 = bob3
+  await bob3.initialize()
+  assert(await waitUntil(() => bob3.from('alice').some(m => m.content === 'WHILE-YOU-WERE-OUT'), 6000), 'offline message DELIVERED after the peer returns (queue drained, envelope opened)')
+  const offMsg = bob3.from('alice').find(m => m.content === 'WHILE-YOU-WERE-OUT')
+  assert(offMsg?.meta?.offline === true, 'delivery is flagged as an offline envelope (no PFS disclosure)')
+  assert(await waitUntil(() => alice.channelMsgs.some(m => m.meta?.type === 'delivered'), 6000), 'sender gets an explicit delivery confirmation for the deferred message')
+
+  console.log('\n📥 IT13: myc_recv — host-independent inbox drain')
+  const recvTxt = bob3.toolText(await bob3.callTool('myc_recv', {}))
+  assert(recvTxt.includes('WHILE-YOU-WERE-OUT'), 'myc_recv returns the delivered message')
+  const recvTxt2 = bob3.toolText(await bob3.callTool('myc_recv', {}))
+  assert(recvTxt2.includes('No pending messages'), 'second myc_recv call finds a drained inbox')
+
+  console.log('\n🧩 IT14: chunking — a 120KB message crosses the 64KB relay frame cap intact')
+  bob3.clear()
+  const bigText = 'CHUNK-START|' + 'x'.repeat(120_000) + '|CHUNK-END'
+  const bigRes = alice.toolText(await alice.callTool('myc_send', { target: 'bob', text: bigText, type: 'info' }))
+  assert(bigRes.includes('chunks'), `send reports chunking (${bigRes.trim()})`)
+  assert(await waitUntil(() => bob3.from('alice').some(m => typeof m.content === 'string' && m.content.length === bigText.length), 10_000), 'reassembled message delivered')
+  const bigMsg = bob3.from('alice').find(m => m.content?.length === bigText.length)
+  assert(bigMsg?.content === bigText, 'chunked content is byte-identical after reassembly')
+  assert((bigMsg?.meta?.chunked ?? 0) >= 5, `delivery metadata reports the chunk count (${bigMsg?.meta?.chunked})`)
+
+  console.log('\n🔑 IT15: key rotation — continuity-signed, no TOFU violation, relay binding migrates')
+  const allowBefore: any = await (await fetch(`http://127.0.0.1:${PORT}/admin/allowlist`, { headers: { Authorization: `Bearer ${TOKEN}` } })).json()
+  const aliceKeyBefore = allowBefore.bindings?.default?.alice
+  assert(typeof aliceKeyBefore === 'string', 'admin allowlist endpoint exposes the current binding')
+  bob3.clear()
+  const rotRes = alice.toolText(await alice.callTool('myc_rotate_key', { confirm: true }))
+  assert(rotRes.includes('✅ Identity rotated'), `rotation succeeds (${rotRes.split('\n')[0]})`)
+  assert(await waitUntil(() => bob3.channelMsgs.some(m => m.meta?.type === 'key_rotated' && m.meta?.peer === 'alice'), 6000), 'peer verified the continuity signature and updated its pin')
+  assert(await waitUntil(() => alice.stderr.filter(l => /Auth OK/.test(l)).length >= 2, 8000), 'alice re-authenticated under the NEW key (binding migrated, no token needed)')
+  assert(!bob3.stderrHas(/TOFU VIOLATION: alice/), 'NO TOFU violation at the peer — rotation is seamless')
+  const allowAfter: any = await (await fetch(`http://127.0.0.1:${PORT}/admin/allowlist`, { headers: { Authorization: `Bearer ${TOKEN}` } })).json()
+  assert(allowAfter.bindings?.default?.alice && allowAfter.bindings.default.alice !== aliceKeyBefore, 'relay name binding migrated to the new key')
+  bob3.clear()
+  await waitUntil(() => alice.stderrHas(/STS verified: bob/), 6000)
+  await alice.callTool('myc_send', { target: 'bob', text: 'POST-ROTATE', type: 'info' })
+  assert(await waitUntil(() => bob3.from('alice').some(m => m.content === 'POST-ROTATE'), 6000), 'delivery works after rotation')
+
+  console.log('\n🚷 IT16: revoked key is refused even WITH the invite token')
+  // IT11's admin revoke blocklisted original-bob's key; the old identity must not
+  // be able to re-register itself using the (long-lived) room token.
+  const oldBob = spawnPeer('bob', 'bob') // the ORIGINAL bob keys from IT1
+  assert(await waitUntil(() => oldBob.stderrHas(/key revoked/), 6000), 'relay rejects the revoked key at auth')
+  assert(!oldBob.stderrHas(/Auth OK/), 'revoked peer never authenticates')
+  oldBob.kill()
+
+  console.log('\n🏘️ IT17: multi-room membership + per-room isolation + discovery')
+  const carol = spawnPeer('carol')
+  ;(carol as any) // carol: default only — spawn multi-room dana + ops-only erin
+  await carol.initialize()
+  const dana = new (await import('./test-helpers.ts')).PeerProc({ name: 'dana', relayUrl: RELAY_URL, token: TOKEN, scratchDir: SCRATCH, room: 'default,ops' })
+  await dana.initialize()
+  const erin = new (await import('./test-helpers.ts')).PeerProc({ name: 'erin', relayUrl: RELAY_URL, token: TOKEN, scratchDir: SCRATCH, room: 'ops' })
+  await erin.initialize()
+  assert(await waitUntil(() => dana.stderrHas(/Auth OK/) && erin.stderrHas(/Auth OK/), 6000), 'multi-room + ops-only peers authenticated')
+  erin.clear(); carol.clear()
+  await waitUntil(() => dana.stderrHas(/STS verified: erin@ops/), 6000)
+  const danaSend = dana.toolText(await dana.callTool('myc_send', { target: 'erin', text: 'OPS-ONLY', type: 'info' }))
+  assert(danaSend.includes('🔒') || danaSend.includes('🆕'), `dana→erin send accepted (${danaSend.trim()})`)
+  assert(await waitUntil(() => erin.from('dana').some(m => m.content === 'OPS-ONLY'), 6000), 'ops-room unicast delivered')
+  const opsMsg = erin.from('dana').find(m => m.content === 'OPS-ONLY')
+  assert(opsMsg?.meta?.room === 'ops', `delivery is tagged with its room (${opsMsg?.meta?.room})`)
+  await Bun.sleep(500)
+  assert(!carol.from('dana').some(m => m.content === 'OPS-ONLY'), 'default-room peer did NOT receive the ops message (room isolation)')
+  const roomsTxt = dana.toolText(await dana.callTool('myc_rooms', {}))
+  assert(/default: \d+ peer/.test(roomsTxt) && /ops: \d+ peer/.test(roomsTxt), `discovery lists both rooms (${roomsTxt.replace(/\n/g, ' | ')})`)
+  carol.kill(); dana.kill(); erin.kill()
+
+  console.log('\n📌 IT18: multi-relay fingerprint pinning (set match) + wrong-pin refusal')
+  const relayKeysFile = JSON.parse(require('fs').readFileSync(join(SCRATCH, 'relay-keys.json'), 'utf8'))
+  const relayPub = sodium.from_base64(relayKeysFile.public, sodium.base64_variants.ORIGINAL)
+  const realFp = Array.from(sodium.crypto_hash(relayPub).slice(0, 16))
+    .map((b: number) => b.toString(16).padStart(2, '0')).join('').match(/.{4}/g)!.join(':')
+  const pinned = new (await import('./test-helpers.ts')).PeerProc({
+    name: 'pinned-peer', relayUrl: RELAY_URL, token: TOKEN, scratchDir: SCRATCH,
+    extraEnv: { MYC_RELAY_FINGERPRINT: `dead:beef:0000:0000:0000:0000:0000:0000,${realFp}` },
+  })
+  assert(await waitUntil(() => pinned.stderrHas(/Relay identity verified/) && pinned.stderrHas(/Auth OK/), 6000), 'fingerprint LIST pins the relay (failover keeps identity pinning)')
+  pinned.kill()
+  const misPinned = new (await import('./test-helpers.ts')).PeerProc({
+    name: 'mispinned-peer', relayUrl: RELAY_URL, token: TOKEN, scratchDir: SCRATCH,
+    extraEnv: { MYC_RELAY_FINGERPRINT: 'dead:beef:0000:0000:0000:0000:0000:0000' },
+  })
+  assert(await waitUntil(() => misPinned.stderrHas(/RELAY IDENTITY MISMATCH/), 6000), 'wrong pin refuses to send credentials')
+  assert(!misPinned.stderrHas(/Auth OK/), 'mis-pinned peer never authenticates')
+  misPinned.kill()
+
+  console.log('\n🔐 IT19: passphrase-encrypted identity key file')
+  const pp = new (await import('./test-helpers.ts')).PeerProc({
+    name: 'vault-peer', relayUrl: RELAY_URL, token: TOKEN, scratchDir: SCRATCH,
+    extraEnv: { MYC_KEY_PASSPHRASE: 'hunter2' },
+  })
+  assert(await waitUntil(() => pp.stderrHas(/Auth OK/), 6000), 'peer with passphrase-encrypted keys authenticates')
+  const fpLine = pp.stderr.find(l => /Fingerprint:/.test(l)) ?? ''
+  pp.kill()
+  await Bun.sleep(300)
+  const keyFileRaw = JSON.parse(require('fs').readFileSync(join(SCRATCH, 'vault-peer-keys.json'), 'utf8'))
+  assert(typeof keyFileRaw.cipher === 'string' && !keyFileRaw.sign_secret, 'key file on disk is encrypted (no plaintext secret)')
+  const pp2 = new (await import('./test-helpers.ts')).PeerProc({
+    name: 'vault-peer', relayUrl: RELAY_URL, token: TOKEN, scratchDir: SCRATCH,
+    extraEnv: { MYC_KEY_PASSPHRASE: 'hunter2' },
+  })
+  assert(await waitUntil(() => pp2.stderr.some(l => /Fingerprint:/.test(l) && l === fpLine), 6000), 'same passphrase restores the SAME identity')
+  pp2.kill()
+  const pp3 = new (await import('./test-helpers.ts')).PeerProc({
+    name: 'vault-peer', relayUrl: RELAY_URL, token: TOKEN, scratchDir: SCRATCH,
+    extraEnv: { MYC_KEY_PASSPHRASE: 'wrong-pass' },
+  })
+  assert(await waitUntil(() => pp3.stderrHas(/wrong passphrase/), 6000), 'wrong passphrase is refused (fail-closed)')
+  pp3.kill()
 
 } catch (e) {
   console.error('\n💥 Integration error:', e)

@@ -129,11 +129,16 @@ try {
   assert(await waitUntil(() => bob.channelMsgs.some(m => m.content === 'OOO-5'), 3000), 'newer frame (seq 5) delivered')
   assert(await waitUntil(() => bob.channelMsgs.some(m => m.content === 'OOO-3'), 3000), 'reordered older frame (seq 3 after 5) ALSO delivered')
 
-  console.log('\n🔁 P3: an exact replay of a seen frame is still dropped')
+  console.log('\n🔁 P3: an exact replay of a seen frame is dropped but RE-ACKED')
+  // v0.3.0: a verified duplicate usually means the ack was lost — the receiver
+  // must re-ack (so the sender's retransmission loop terminates) without
+  // delivering twice.
+  const acksBefore = bobFrames.filter(f => f.type === '_ack').length
   bobSock.send(JSON.stringify(replayed3)) // byte-identical resend
   await Bun.sleep(500)
   assert(bob.channelMsgs.filter(m => m.content === 'OOO-3').length === 1, 'replayed frame delivered exactly once')
-  assert(bob.stderr.some(l => /Replay BLOCKED/.test(l)), 'replay logged as blocked')
+  assert(bob.stderr.some(l => /Replay dedup: re-acked/.test(l)), 'replay logged as dedup + re-ack')
+  assert(bobFrames.filter(f => f.type === '_ack').length > acksBefore, 'duplicate was re-acked (lost-ack recovery)')
 
   console.log('\n📭 P4: verified-but-undecryptable frame → model notified + sender nacked')
   // Valid alice signature over a ciphertext bob cannot open (stale-session simulation —
@@ -141,30 +146,49 @@ try {
   bob.clear()
   const wrongKey = sodium.crypto_box_keypair()
   bobSock.send(JSON.stringify(aliceFrame('GARBLED', 6, 'garbled-1', { encKey: wrongKey.privateKey })))
-  assert(await waitUntil(() => bob.channelMsgs.some(m => m.meta?.type === 'decrypt_failed'), 3000), 'decrypt failure surfaced to the model (not silent)')
-  assert(bob.channelMsgs.every(m => m.content !== 'GARBLED'), 'no attacker-controlled content surfaced')
   assert(await waitUntil(() => bobFrames.some(f => f.type === '_nack' && f.target === 'alice'), 3000), 'bob sent a _nack to the sender for a resend')
+  assert(bob.channelMsgs.every(m => m.content !== 'GARBLED'), 'no attacker-controlled content surfaced')
+  // v0.3.0: the model is NOT interrupted for a recoverable decrypt failure —
+  // the nack triggers the sender's automatic retransmission. msg_id must NOT be
+  // committed, or the same-id retransmission would be dedup-dropped unread.
+  assert(bob.stderr.some(l => /decrypt failed.*nacking garbled-1/.test(l)), 'decrypt failure logged with the nacked msg_id')
+  bobSock.send(JSON.stringify(aliceFrame('GARBLED-RETRY', 7, 'garbled-1'))) // same msg_id, decryptable
+  assert(await waitUntil(() => bob.channelMsgs.some(m => m.content === 'GARBLED-RETRY'), 3000), 'same-msg_id retransmission after decrypt failure IS delivered (msg_id not burned)')
 
-  console.log('\n📬 P4b: sender receiving a _nack gets a precise resend notification')
-  // The other half of the loop: bob SENDS a tracked message, "alice" nacks it, and
-  // bob's model must be told which message failed instead of waiting out a 30s timer.
+  console.log('\n📬 P4b: sender receiving a _nack retransmits AUTOMATICALLY (same msg_id)')
+  // The other half of the loop: bob SENDS a tracked message, "alice" nacks it.
+  // v0.3.0: instead of telling the model to resend, the outbox retransmits with
+  // the SAME msg_id; the model hears nothing until confirmed delivery/terminal failure.
   bob.clear()
   await bob.callTool('myc_send', { target: 'alice', text: 'TO-BE-NACKED', type: 'info' })
   assert(await waitUntil(() => bobFrames.some(f => f.type === 'info' && f.target === 'alice' && f.msg_id), 3000), 'bob sent the tracked message')
   const sentFrame = bobFrames.filter(f => f.type === 'info' && f.target === 'alice').at(-1)
+  const framesBeforeNack = bobFrames.filter(f => f.type === 'info' && f.msg_id === sentFrame.msg_id).length
   const nackEnc = encTo(`nack:${sentFrame.msg_id}`)
   bobSock.send(JSON.stringify({
     from: 'alice', target: 'bob', type: '_nack', encrypted: nackEnc.encrypted, nonce: nackEnc.nonce,
     e2e: true, sender: 'alice', session_id: aliceSid, payload: null, msg_id: 'nack-1', seq: 100,
   }))
-  assert(await waitUntil(() => bob.channelMsgs.some(m => m.meta?.type === 'delivery_failed' && m.meta?.msg_id === sentFrame.msg_id), 3000), 'sender notified of the failed delivery with the exact msg_id')
+  assert(await waitUntil(() => bobFrames.filter(f => f.type === 'info' && f.msg_id === sentFrame.msg_id).length > framesBeforeNack, 3000), 'nack triggered automatic retransmission with the SAME msg_id')
+  assert(bob.stderr.some(l => new RegExp(`resent ${sentFrame.msg_id}`).test(l)), 'retransmission logged (model not interrupted)')
+  // Close the loop: alice acks the retransmission → the model gets a delivery
+  // confirmation (it had a deferred/retried send outstanding).
+  const ackEnc = encTo(`ack:${sentFrame.msg_id}`)
+  bobSock.send(JSON.stringify({
+    from: 'alice', target: 'bob', type: '_ack', encrypted: ackEnc.encrypted, nonce: ackEnc.nonce,
+    e2e: true, sender: 'alice', session_id: aliceSid, payload: null, msg_id: 'ack-1', seq: 101,
+  }))
+  assert(await waitUntil(() => bob.channelMsgs.some(m => m.meta?.type === 'delivered' && m.meta?.msg_id === sentFrame.msg_id), 3000), 'retried delivery confirmed to the model after the ack')
 
   console.log('\n📡 P5: relay error/queued status frames are surfaced, not swallowed')
   bob.clear()
   bobSock.send(JSON.stringify({ type: 'error', from: '_relay', payload: 'alice offline; queue full, message dropped', msg_id: 'drop-1' }))
-  bobSock.send(JSON.stringify({ type: 'queued', from: '_relay', payload: 'alice offline', msg_id: 'q-1' }))
+  bobSock.send(JSON.stringify({ type: 'queued', from: '_relay', payload: 'alice offline', msg_id: 'q-1', ttl_s: 300 }))
+  // 'error' for an UNTRACKED msg_id (nothing in the outbox to retry) surfaces to
+  // the model; tracked ids feed the retransmission loop instead. 'queued' is
+  // v0.3.0 log-only — the sender was told 📮 at send time.
   assert(await waitUntil(() => bob.channelMsgs.some(m => m.meta?.type === 'relay_error'), 3000), "relay 'error' frame surfaced to the model")
-  assert(await waitUntil(() => bob.channelMsgs.some(m => m.meta?.type === 'relay_queued'), 3000), "relay 'queued' frame surfaced to the model")
+  assert(await waitUntil(() => bob.stderr.some(l => /Relay queued: alice offline/.test(l)), 3000), "relay 'queued' status logged (sender already told at send time)")
 
   console.log('\n🕵️ P6: wrong STS binding signature → fail-closed teardown (possible MITM)')
   // alice ('alice' < 'bob') is the STS initiator; bob responds. We complete the

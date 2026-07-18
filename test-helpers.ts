@@ -16,6 +16,8 @@ export interface PeerProcOpts {
   /** Basename prefix for key/tofu/replay files (defaults to `name`) — lets a test
    *  restart a peer under the same name with a DIFFERENT identity. */
   filePrefix?: string
+  /** Additional env (MYC_RELAY_FINGERPRINT, MYC_KEY_PASSPHRASE, …). */
+  extraEnv?: Record<string, string>
 }
 
 export class PeerProc {
@@ -41,6 +43,7 @@ export class PeerProc {
         MYC_KEY_FILE: join(opts.scratchDir, `${prefix}-keys.json`),
         MYC_TOFU_FILE: join(opts.scratchDir, `${prefix}-tofu.json`),
         MYC_REPLAY_FILE: join(opts.scratchDir, `${prefix}-replay.json`),
+        ...(opts.extraEnv ?? {}),
       },
       stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
     })

@@ -1,7 +1,7 @@
 {
   "name": "@yoda.digital/mycelium",
-  "version": "0.2.1",
-  "description": "End-to-end encrypted messaging between Claude Code instances. Curve25519 PFS, Ed25519 TOFU, replay protection, stateless relay.",
+  "version": "0.3.0",
+  "description": "End-to-end encrypted messaging between Claude Code instances. Curve25519 PFS, Ed25519 TOFU, offline identity envelopes, automatic retransmission, replay protection, zero-plaintext relay.",
   "type": "module",
   "bin": {
     "mycelium-peer": "build/peer-channel.js",
