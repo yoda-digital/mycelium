@@ -7,7 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_Nothing yet. New entries land here between releases._
+Post-v0.3.0 audit follow-through. A state-of-the-art / mass-adoption audit
+ranked the highest-leverage gaps; this batch implements the safe, test-gated
+ones (portability, durability, least-privilege, verification UX) and lands
+reviewed design specs for the multi-month crypto/transport work under
+[`docs/roadmap/`](./docs/roadmap/). Test count: 176 → 195 (five suites,
+including a crash-recovery suite and a Node↔Bun interop suite).
+
+### Added
+
+- **`myc_verify` tool** — read-only display of the pinned Ed25519 fingerprint for
+  any peer, or this peer's own identity. The documented out-of-band verification
+  ceremony was only reachable for a *blocked* peer via `myc_trust`; it is now
+  executable for a healthy peer, so the first-contact TOFU window can be closed
+  proactively.
+- **Node / `npx` support** — the peer bin is now built `--target node` with a
+  `#!/usr/bin/env node` shebang and runs under both Node and Bun. A host without
+  Bun can install the peer with `npx -y @yoda.digital/mycelium mycelium-peer`.
+  New `node >= 22` engine. The relay remains Bun-only (it uses `Bun.serve`).
+- **Crash-durable offline queue** (opt-in `RELAY_QUEUE_FILE`) — persists the
+  offline queue (ciphertext only, atomic write) and restores it on boot, so a
+  relay restart no longer drops mail whose sender may itself be gone.
+- **`demo.ts` / `bun run demo`** — zero-config proof of zero-plaintext-at-relay,
+  side-by-side ciphertext-on-wire vs decrypted plaintext.
+- **`docs/wire-protocol-v2.md`**, **`llms.txt`**, **`server.json`** (MCP registry
+  manifest), and reviewed roadmap specs in `docs/roadmap/`.
+- New test suites: `test-durability.ts` (sender-death + relay-restart recovery)
+  and `test-node-smoke.ts` (a Node peer interoperating with a Bun peer).
+
+### Changed
+
+- **`RELAY_QUEUE_TTL_S` default 300 → 3600s**, matching the peer's default offline
+  window (`MYC_OFFLINE_MAX_AGE_S`). The old default silently dropped offline mail
+  ~5 min in, while the sender was not told "failed" until ~65 min later.
+
+### Security
+
+- **BREAKING — admin/health split off the invite token.** `/admin/*` and
+  `/health` are now gated by `RELAY_ADMIN_TOKEN` / `RELAY_HEALTH_TOKEN`
+  respectively; when unset they are loopback-only. The long-lived invite
+  `RELAY_TOKEN` is **no longer** an admin credential, so an invited peer can no
+  longer read the name↔key social graph or revoke other peers. Existing
+  deployments that drove `/admin/*` with `RELAY_TOKEN` must set
+  `RELAY_ADMIN_TOKEN` (or call from loopback).
+
+### Docs
+
+- Corrected overstated claims: "full PFS" → "per-connection PFS"; offline
+  seal-to-identity framed as a current design choice with a prekey upgrade path,
+  not a necessity; rotation "nothing breaks" qualified to peers online or
+  returning within the offline window. Documented the `npx` path and that
+  `--dangerously-load-development-channels` is optional (`myc_recv` works on any
+  MCP host).
 
 ## [0.3.0] - 2026-07-18
 

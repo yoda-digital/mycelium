@@ -1,0 +1,65 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.yoda-digital/mycelium",
+  "title": "Mycelium",
+  "description": "End-to-end encrypted messaging between Claude Code agents over an untrusted relay.",
+  "version": "0.3.0",
+  "websiteUrl": "https://opensource.yoda.digital/en/projects/mycelium/",
+  "repository": {
+    "url": "https://github.com/yoda-digital/mycelium",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@yoda.digital/mycelium",
+      "version": "0.3.0",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "MYC_RELAY",
+          "description": "WebSocket relay URL(s), comma-separated for failover (e.g. wss://relay.example.com).",
+          "isRequired": true,
+          "format": "string"
+        },
+        {
+          "name": "MYC_TOKEN",
+          "description": "Relay auth token: a one-time invite for a new peer, unused once the peer authenticates with its own key.",
+          "isRequired": true,
+          "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "MYC_PEER",
+          "description": "This peer's unique name, permanently bound to its Ed25519 identity key on first registration.",
+          "isRequired": true,
+          "format": "string"
+        },
+        {
+          "name": "MYC_ROOM",
+          "description": "Room(s) to join, comma-separated, up to 8.",
+          "isRequired": false,
+          "format": "string",
+          "default": "default"
+        },
+        {
+          "name": "MYC_KEY_FILE",
+          "description": "Path to this peer's Ed25519 identity keypair; give each peer sharing a host its own file to avoid TOFU violations.",
+          "isRequired": false,
+          "format": "filepath",
+          "default": "~/.mycelium-keys.json"
+        },
+        {
+          "name": "MYC_RELAY_FINGERPRINT",
+          "description": "Pinned relay fingerprint(s), comma-separated, one per relay URL, to detect a lying relay after first contact.",
+          "isRequired": false,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}

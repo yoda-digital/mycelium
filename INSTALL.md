@@ -286,17 +286,17 @@ All projects share `~/.mycelium-known-peers.json` by default. If different proje
 
 ### Revoke a peer
 
-The admin API (bearer auth = the relay token) removes the name binding, blocklists the key so it cannot re-invite itself with the token, and kicks the live connection:
+The admin API removes the name binding, blocklists the key so it cannot re-invite itself with the token, and kicks the live connection. Admin auth is **`RELAY_ADMIN_TOKEN`**, not the invite token — set it (`export RELAY_ADMIN_TOKEN=$(openssl rand -hex 32)` on the relay) or, if you leave it unset, call the admin API from **loopback on the relay host** (it is loopback-only by default). The invite `RELAY_TOKEN` is deliberately *not* an admin credential:
 
 ```bash
-curl -X POST -H "Authorization: Bearer $RELAY_TOKEN" -H 'Content-Type: application/json' \
+curl -X POST -H "Authorization: Bearer $RELAY_ADMIN_TOKEN" -H 'Content-Type: application/json' \
   -d '{"room":"default","name":"mallory"}' http://relay:9900/admin/revoke
 
 # See current bindings
-curl -H "Authorization: Bearer $RELAY_TOKEN" http://relay:9900/admin/allowlist
+curl -H "Authorization: Bearer $RELAY_ADMIN_TOKEN" http://relay:9900/admin/allowlist
 
 # Changed your mind
-curl -X POST -H "Authorization: Bearer $RELAY_TOKEN" -H 'Content-Type: application/json' \
+curl -X POST -H "Authorization: Bearer $RELAY_ADMIN_TOKEN" -H 'Content-Type: application/json' \
   -d '{"room":"default","pubkey":"<base64-key>","undo":true}' http://relay:9900/admin/revoke
 ```
 
@@ -323,7 +323,8 @@ Expect `0 failed` across all three suites — 89 unit, 63 integration (real rela
 ### Health check
 
 ```bash
-curl -s -H "Authorization: Bearer $RELAY_TOKEN" http://localhost:9900/health | jq .
+curl -s -H "Authorization: Bearer $RELAY_HEALTH_TOKEN" http://localhost:9900/health | jq .
+# (or, with no RELAY_HEALTH_TOKEN set, just call it from loopback on the relay host)
 ```
 
 ```json
@@ -378,14 +379,17 @@ Back up the two key files. Losing the peer key means a new identity (TOFU violat
 
 | Variable | Default | Description |
 |---|---|---|
-| `RELAY_TOKEN` | *required* | Room invite token, presented once by new peers. |
+| `RELAY_TOKEN` | *required* | Room invite token, presented once by new peers. Not an admin credential. |
+| `RELAY_ADMIN_TOKEN` | *(none)* | Bearer token for `/admin/*`. Unset ⇒ admin is loopback-only. |
+| `RELAY_HEALTH_TOKEN` | *(none)* | Bearer token for `/health`. Unset ⇒ falls back to the admin rule. |
 | `RELAY_PORT` | `9900` | WebSocket listen port. |
 | `RELAY_MAX_PEERS` | `50` | Max peers per room. |
 | `RELAY_MAX_MSG_BYTES` | `65536` | Max frame size. Peers chunk larger messages automatically. |
 | `RELAY_RATE_LIMIT` | `300` | Messages per minute per peer (token bucket). |
 | `RELAY_QUEUE_MAX_MSGS` | `50` | Offline queue depth per peer. |
 | `RELAY_QUEUE_MAX_BYTES` | `524288` | Offline queue max total bytes. |
-| `RELAY_QUEUE_TTL_S` | `300` | Offline message TTL. Keep at or below the peers' `MYC_OFFLINE_MAX_AGE_S`, or queued messages expire cryptographically before they expire physically. |
+| `RELAY_QUEUE_TTL_S` | `3600` | Offline message TTL. Defaults to the peer offline window; keep at or above the peers' `MYC_OFFLINE_MAX_AGE_S` so queued mail is not dropped before the sender's ack window closes. |
+| `RELAY_QUEUE_FILE` | *(none)* | Persist the offline queue (ciphertext) to this path, restored on boot — survives a relay restart. Unset ⇒ in-memory. |
 | `RELAY_REQUIRE_TLS` | `false` | Reject connections without `X-Forwarded-Proto: https`. |
 | `RELAY_TRUSTED_PROXY` | `false` | Trust `X-Forwarded-For` for per-IP limits. |
 | `RELAY_MAX_IP_CONNS` | `10` | Max simultaneous connections per IP. |

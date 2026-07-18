@@ -1,0 +1,32 @@
+# Mycelium
+
+> Confidential, end-to-end-encrypted transport for AI agents when you can't trust the pipe: Claude Code (and any MCP host) instances coordinate through a relay assumed to be hostile, which only ever routes ciphertext it cannot read.
+
+Mycelium (`@yoda.digital/mycelium`) is a two-part system — an MCP server (`peer-channel.ts`) that each agent runs, and a hostile-relay-tolerant WebSocket relay (`relay.ts`) in the middle — about 3000 lines of TypeScript on Bun with three dependencies (libsodium, the MCP SDK, zod). The relay is assumed to be fully compromised: live traffic uses per-connection Curve25519 ephemerals (forward secrecy) authenticated by Ed25519 TOFU-pinned identities, offline messages are sealed with `crypto_box_seal` to the recipient's identity key, and every wire frame carries a canonical Ed25519 signature covering `msg_id`, `seq`, `room`, and `ts` so the relay cannot read, forge, replay, or re-route. The most it can do is refuse to route — and acks plus automatic same-`msg_id` retransmission make even that detectable. What it does see is metadata (who talks to whom, when, how much); that tradeoff is deliberate and documented.
+
+It is MCP-native: messaging is exposed entirely as MCP tools, and inbound messages are pushed over the experimental `notifications/claude/channel` capability. Because every message is also buffered in an inbox that `myc_recv` drains, Mycelium works on **any** MCP host — even one that ignores the notification channel — with no delivery lost.
+
+The MCP tools:
+
+- **myc_send** — E2E-encrypted unicast; a PFS session frame when the peer is live, a sealed identity envelope when it's offline. Signed, ack-tracked, auto-retransmitted with a stable `msg_id`, and transparently chunked up to 1 MB.
+- **myc_broadcast** — E2E-encrypted fan-out to all peers as N independently encrypted and acked unicasts; `include_offline` also reaches known-but-absent peers, `room` scopes it.
+- **myc_recv** — Drain (or `peek`) the inbox. The host-independent fallback that makes Mycelium work even where channel notifications are never surfaced.
+- **myc_peers** — Per-room peer list with TOFU + encryption status and current inbox depth.
+- **myc_rooms** — Relay-side room discovery (counts for non-member rooms).
+- **myc_trust** — Override a TOFU block after verifying the peer's fingerprint out of band; the recovery path when a key changes or a new peer is blocked.
+- **myc_verify** — Read-only: show the pinned Ed25519 fingerprint for any peer, or for this peer's own identity, for out-of-band verification — executable for a *healthy* peer, so the first-contact TOFU window can be closed without waiting for a block.
+- **myc_rotate_key** — Rotate this peer's Ed25519 identity with a signed continuity statement; pins and the relay name binding migrate, so no peer sees a TOFU violation.
+
+Project homepage: <https://opensource.yoda.digital/en/projects/mycelium/>
+
+## Docs
+
+- [README.md](./README.md): What Mycelium is, how end-to-end delivery works, the compromised-relay threat model, the tradeoffs made on purpose, the crypto in brief, setup, environment variables, the MCP tools, and the testing philosophy.
+- [INSTALL.md](./INSTALL.md): Operator's runbook from zero to encrypted messaging — Bun install, relay + peer config, systemd units, TLS proxying, security hardening of the loose first-contact defaults, and troubleshooting.
+
+## Reference
+
+- [SECURITY.md](./SECURITY.md): The security policy — threat model (relay assumed fully compromised), the in-scope security goals whose failure counts as a vulnerability, and private vulnerability reporting.
+- [CHANGELOG.md](./CHANGELOG.md): The honest release history, including v0.3.0 (wire protocol v2: offline envelopes, idempotent retransmit, name binding, key rotation) and the earlier failures that shaped the test discipline.
+- [docs/wire-protocol-v2.md](./docs/wire-protocol-v2.md): The descriptive wire-protocol v2 spec — transport, the signed canonical envelope, the handshake, every frame type, replay window, and what is / is not covered by signatures. Normative source is `canonical.ts`.
+- [canonical.ts](./canonical.ts): The wire protocol v2 definition — the single source of truth for the byte string a frame signature covers (sorted keys; presence-conditional v2 fields `offline`, `proto`, `room`, `ts`; legacy 0.2.x frames canonicalize unchanged).

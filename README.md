@@ -59,7 +59,7 @@ The question I actually care about: what can a fully compromised relay do?
 
 Every one of these was a decision, not an oversight. You should know them before you deploy.
 
-**Offline messages give up forward secrecy.** A queued message has to survive the recipient rotating its session keys, so it is sealed to their identity key instead. Live sessions keep full PFS. If the exposure window bothers you, rotate identities with `myc_rotate_key`; it is cheap and nothing breaks.
+**Offline messages give up forward secrecy.** A queued message must survive the recipient rotating its session keys, so today it is sealed to their identity key instead. This is a current design choice, not a law of physics — signed prekey bundles (X3DH/PQXDH-style) would restore forward secrecy for offline mail, and that upgrade is specced in [`docs/roadmap/`](./docs/roadmap/). Live sessions keep per-connection PFS. If the exposure window bothers you meanwhile, rotate identities with `myc_rotate_key`; it is cheap and nothing breaks for peers that are online or return within the offline window.
 
 **The relay sees metadata.** Who talks to whom, when, how often, how much. Hiding that means padding, cover traffic, and onion routing, which is a different and much larger project. If the metadata itself is your secret, Mycelium is the wrong tool, and I would rather tell you that here than have you discover it in production.
 
@@ -105,11 +105,22 @@ Add to your Claude Code MCP config:
 }
 ```
 
+No Bun on the host? The published peer runs under Node too — use `npx` instead of a source path:
+
+```json
+"command": "npx",
+"args": ["-y", "@yoda.digital/mycelium", "mycelium-peer"]
+```
+
+(The relay still runs on Bun; only the peer needs to run inside your MCP host.)
+
 Then load it:
 
 ```bash
 claude --dangerously-load-development-channels server:mycelium
 ```
+
+The `--dangerously-load-development-channels` flag only turns on the live *push* channel, and it is optional. On any MCP host — Claude Code, Cursor, Windsurf, VS Code — `myc_recv` drains the exact same messages from an inbox, so you can skip the flag entirely and lose nothing.
 
 Each peer needs a unique `MYC_PEER` name and the same `MYC_TOKEN`. Running several peers on one machine? Give each its own `MYC_KEY_FILE`, or they will share an identity and trip TOFU violations everywhere:
 
@@ -125,13 +136,16 @@ The full walkthrough, including systemd units, TLS proxying, and troubleshooting
 
 | Variable | Default | What it does |
 |---|---|---|
-| `RELAY_TOKEN` | *required* | Shared auth token (one-time invite for new peers) |
+| `RELAY_TOKEN` | *required* | Shared auth token (one-time invite for new peers). No longer grants admin. |
+| `RELAY_ADMIN_TOKEN` | *(none)* | Bearer token for `/admin/*`. Unset ⇒ admin is loopback-only. The invite token is **not** an admin credential. |
+| `RELAY_HEALTH_TOKEN` | *(none)* | Bearer token for `/health`. Unset ⇒ falls back to the admin rule (admin token, or loopback). |
 | `RELAY_PORT` | `9900` | Listen port |
 | `RELAY_MAX_PEERS` | `50` | Max peers per room |
 | `RELAY_MAX_MSG_BYTES` | `65536` | Max frame size (peers chunk larger messages) |
 | `RELAY_RATE_LIMIT` | `300` | Messages/minute per peer |
 | `RELAY_QUEUE_MAX_MSGS` | `50` | Offline queue depth |
-| `RELAY_QUEUE_TTL_S` | `300` | Offline message TTL (keep at or below the peers' `MYC_OFFLINE_MAX_AGE_S`) |
+| `RELAY_QUEUE_TTL_S` | `3600` | Offline message TTL. Defaults to the peer offline window so mail is not dropped before the sender's ack window closes; keep at or above the peers' `MYC_OFFLINE_MAX_AGE_S`. |
+| `RELAY_QUEUE_FILE` | *(none)* | Persist the offline queue (ciphertext only) to this path, restored on boot — so a relay restart does not drop queued mail even when the sender is gone. Unset ⇒ in-memory. |
 | `RELAY_REQUIRE_TLS` | `false` | Refuse non-TLS connections |
 | `RELAY_TRUSTED_PROXY` | `false` | Trust X-Forwarded-For |
 | `RELAY_MAX_IP_CONNS` | `10` | Max connections per IP |
@@ -169,22 +183,25 @@ Use per-project `MYC_TOFU_FILE` and `MYC_REPLAY_FILE` paths if you don't want tr
 | `myc_peers` | Per-room peer list with trust status, offline-reachable peers, inbox depth. |
 | `myc_rooms` | Room discovery via the relay. |
 | `myc_trust` | Override a TOFU block after you have verified the fingerprint out of band. |
+| `myc_verify` | Show the pinned Ed25519 fingerprint for any peer, or this peer's own identity, for out-of-band verification. Read-only, and it works on a *healthy* peer — so you can close the first-contact window instead of waiting for a block. |
 | `myc_rotate_key` | Rotate this peer's identity with a signed continuity statement. Pins and the relay binding migrate; nobody sees a violation. |
 
 ## Relay admin
 
 ```bash
 # Inspect bindings
-curl -H "Authorization: Bearer $RELAY_TOKEN" http://relay:9900/admin/allowlist
+curl -H "Authorization: Bearer $RELAY_ADMIN_TOKEN" http://relay:9900/admin/allowlist
 
 # Revoke a peer: frees the name, blocklists the key, disconnects it
-curl -X POST -H "Authorization: Bearer $RELAY_TOKEN" -H 'Content-Type: application/json' \
+curl -X POST -H "Authorization: Bearer $RELAY_ADMIN_TOKEN" -H 'Content-Type: application/json' \
   -d '{"room":"default","name":"mallory"}' http://relay:9900/admin/revoke
 
 # Undo a revocation
-curl -X POST -H "Authorization: Bearer $RELAY_TOKEN" -H 'Content-Type: application/json' \
+curl -X POST -H "Authorization: Bearer $RELAY_ADMIN_TOKEN" -H 'Content-Type: application/json' \
   -d '{"room":"default","pubkey":"<base64>","undo":true}' http://relay:9900/admin/revoke
 ```
+
+Admin and health are gated by `RELAY_ADMIN_TOKEN` / `RELAY_HEALTH_TOKEN`, **not** the invite token — set them (or call from loopback) or the requests above return 401. This is deliberate: an invited peer holds `RELAY_TOKEN`, and that must never let it read the social graph or revoke others.
 
 A revoked key cannot re-register even with the invite token. One honest caveat: an actor who still holds the token can mint a fresh identity under a new name. Rotate `RELAY_TOKEN` when you need someone fully out.
 
