@@ -15,6 +15,7 @@ import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprot
 import { z } from 'zod'
 import sodium from 'libsodium-wrappers-sumo'
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync } from 'fs'
+import { canonicalize } from './canonical.ts'
 
 const toB64 = (x: Uint8Array) => sodium.to_base64(x, sodium.base64_variants.ORIGINAL)
 const fromB64 = (x: string) => sodium.from_base64(x, sodium.base64_variants.ORIGINAL)
@@ -154,6 +155,7 @@ function fingerprint(key64: string): string {
 interface PeerSession {
   signPubKey: Uint8Array
   ephEncPubKey: Uint8Array
+  ephSig: string
   sharedKey: Uint8Array
   tofuStatus: 'trusted' | 'new'
   sessionId: string
@@ -165,7 +167,11 @@ const pendingTrustKeys = new Map<string, {
   sign_pubkey: string
   eph_enc_pubkey: string
   eph_enc_pubkey_sig: string
+  session_id?: string
 }>()
+// Peers whose STS binding signature FAILED verification. Fail-closed until the human
+// re-verifies fingerprints out-of-band and runs myc_trust (which clears the flag).
+const stsFailedPeers = new Set<string>()
 
 function processPeerKeys(
   peerName: string,
@@ -175,6 +181,10 @@ function processPeerKeys(
   remoteSessionId?: string,
 ): PeerSession | null {
   if (!signPubKey64 || !ephEncPubKey64 || !ephSig64) return null
+  if (stsFailedPeers.has(peerName)) {
+    log(`🔴 BLOCKED: ${peerName} failed STS verification — myc_trust required to re-enable`)
+    return null // FAIL-CLOSED until explicit human override
+  }
   try {
     const signPubKey = fromB64(signPubKey64)
     const ephEncPubKey = fromB64(ephEncPubKey64)
@@ -192,7 +202,7 @@ function processPeerKeys(
 
     const sharedKey = sodium.crypto_box_beforenm(ephEncPubKey, ephKeys.encPrivateKey)
     const session: PeerSession = {
-      signPubKey, ephEncPubKey, sharedKey,
+      signPubKey, ephEncPubKey, ephSig: ephSig64, sharedKey,
       tofuStatus: tofu,
       sessionId: remoteSessionId ?? '',
       stsVerified: false,
@@ -222,11 +232,44 @@ function processPeerKeys(
 //     symmetric peers never clobber each other's pending state.
 //   • The signed bytes are a deterministic, name-ordered binding both sides derive
 //     identically (no throwaway keypairs, nothing to mis-pair).
-//   • STS NEVER tears down the session. A mismatch leaves the channel
-//     TOFU/eph-sig-authenticated and simply un-flags `stsVerified`.
+//   • STS TIMEOUT is lenient: the channel stays TOFU/eph-sig-authenticated, just
+//     without the 🤝 flag (version skew or slow peers must not break delivery).
+//   • STS SIGNATURE MISMATCH is fail-closed: a peer that produced a *wrong* binding
+//     signature over an authenticated channel is either buggy or under active attack,
+//     so the session is torn down, the peer is blocked, and the human must re-verify
+//     fingerprints and run myc_trust to re-enable (same recovery as a TOFU violation).
 
 interface STSPending {
   timer: ReturnType<typeof setTimeout>
+}
+
+// Fail-closed teardown on STS binding-signature mismatch (possible MITM).
+function stsFail(peerName: string, phase: string): void {
+  const s = peerSessions.get(peerName)
+  log(`🔴 STS VERIFICATION FAILED (${phase}) for ${peerName} — possible MITM! Session blocked.`)
+  if (s) {
+    // Preserve the keys so myc_trust can re-establish after out-of-band verification.
+    pendingTrustKeys.set(peerName, {
+      sign_pubkey: toB64(s.signPubKey),
+      eph_enc_pubkey: toB64(s.ephEncPubKey),
+      eph_enc_pubkey_sig: s.ephSig,
+      session_id: s.sessionId,
+    })
+  }
+  peerSessions.delete(peerName)
+  stsFailedPeers.add(peerName)
+  const pending = stsPending.get(peerName)
+  if (pending) {
+    clearTimeout(pending.timer)
+    stsPending.delete(peerName)
+  }
+  void safeNotify({
+    method: 'notifications/claude/channel',
+    params: {
+      content: `🔴 STS VERIFICATION FAILED for ${peerName} — possible MITM. Messages to/from this peer are BLOCKED. Verify fingerprints out-of-band, then use myc_trust to re-enable.`,
+      meta: { type: 'sts_failed', peer: peerName },
+    },
+  })
 }
 
 const stsPending = new Map<string, STSPending>()
@@ -283,11 +326,10 @@ function handleSTSReply(fromPeer: string, decryptedPayload: string): void {
 
   const binding = stsBinding(fromPeer)
   if (!binding) return
-  if (!sodium.crypto_sign_verify_detached(fromB64(data.sts_sig), binding, s.signPubKey)) {
-    // eph-sig already authenticated the channel — do NOT delete the session.
-    log(`STS mismatch for ${fromPeer} — staying TOFU/eph-sig authenticated, not mutually-verified`)
-    clearTimeout(pending.timer)
-    stsPending.delete(fromPeer)
+  let bindingOk = false
+  try { bindingOk = sodium.crypto_sign_verify_detached(fromB64(data.sts_sig), binding, s.signPubKey) } catch {}
+  if (!bindingOk) {
+    stsFail(fromPeer, 'reply')
     return
   }
 
@@ -310,8 +352,10 @@ function handleSTSComplete(fromPeer: string, decryptedPayload: string): void {
   if (!data.sts_sig) return
   const binding = stsBinding(fromPeer)
   if (!binding) return
-  if (!sodium.crypto_sign_verify_detached(fromB64(data.sts_sig), binding, s.signPubKey)) {
-    log(`STS mismatch (complete) for ${fromPeer} — staying TOFU/eph-sig authenticated`)
+  let bindingOk = false
+  try { bindingOk = sodium.crypto_sign_verify_detached(fromB64(data.sts_sig), binding, s.signPubKey) } catch {}
+  if (!bindingOk) {
+    stsFail(fromPeer, 'complete')
     return
   }
   s.stsVerified = true
@@ -350,44 +394,16 @@ function decryptFrom(peer: string, enc64: string, nonce64: string): string | nul
 // ===========================================================================
 
 function canonicalSign(msg: any): string {
-  // 11 fields, SORTED, ALL semantically meaningful fields covered.
-  // msg_id + seq are IN the canonical — relay can't mint new IDs for signed messages.
-  const canonical = JSON.stringify({
-    e2e: msg.e2e ?? null,
-    encrypted: msg.encrypted ?? null,
-    msg_id: msg.msg_id ?? null,     // signed — prevents relay replay with new IDs
-    nonce: msg.nonce ?? null,
-    payload: msg.payload ?? null,
-    request_id: msg.request_id ?? null,
-    sender: msg.sender ?? null,
-    seq: msg.seq ?? null,           // signed — prevents relay seq manipulation
-    session_id: msg.session_id ?? null,
-    target: msg.target ?? null,
-    type: msg.type ?? null,
-  })
-  return toB64(sodium.crypto_sign_detached(sodium.from_string(canonical), ltKeys.signPrivateKey))
+  return toB64(sodium.crypto_sign_detached(sodium.from_string(canonicalize(msg)), ltKeys.signPrivateKey))
 }
 
 function verifySig(peerName: string, msg: any, sig64: string): boolean {
   const s = peerSessions.get(peerName)
   if (!s) return false
   try {
-    const canonical = JSON.stringify({
-      e2e: msg.e2e ?? null,
-      encrypted: msg.encrypted ?? null,
-      msg_id: msg.msg_id ?? null,
-      nonce: msg.nonce ?? null,
-      payload: msg.payload ?? null,
-      request_id: msg.request_id ?? null,
-      sender: msg.sender ?? null,
-      seq: msg.seq ?? null,
-      session_id: msg.session_id ?? null,
-      target: msg.target ?? null,
-      type: msg.type ?? null,
-    })
     return sodium.crypto_sign_verify_detached(
       fromB64(sig64),
-      sodium.from_string(canonical),
+      sodium.from_string(canonicalize(msg)),
       s.signPubKey,
     )
   } catch {
@@ -421,15 +437,30 @@ function sendCtrl(
 
 const SEEN_EXPIRY_MS = 30 * 60 * 1000
 const SEEN_MAX = 10_000
+// Anti-replay window per (sender, session): highest seq seen + bitmap of the
+// SEQ_WINDOW seqs at/below it (RFC 4303 style). Bit i of `mask` = seq (last - i) seen.
+const SEQ_WINDOW = 64n
+const SEQ_MASK_ALL = (1n << SEQ_WINDOW) - 1n
+interface SeqWindow { last: number; mask: bigint }
 let seenMsgIds = new Map<string, number>()
-let peerSeqs: Record<string, Record<string, number>> = {}
+let peerSeqs: Record<string, Record<string, SeqWindow>> = {}
 
 function loadReplay(): void {
   try {
     if (existsSync(REPLAY_FILE)) {
       const s = JSON.parse(readFileSync(REPLAY_FILE, 'utf8'))
       if (s.seen) seenMsgIds = new Map(Object.entries(s.seen).map(([k, v]) => [k, v as number]))
-      if (s.seqs) peerSeqs = s.seqs
+      if (s.seqs) {
+        for (const [from, sids] of Object.entries(s.seqs) as [string, any][]) {
+          peerSeqs[from] = {}
+          for (const [sid, v] of Object.entries(sids) as [string, any][]) {
+            // v0.2.0 persisted a bare number (strict floor) — migrate conservatively:
+            // treat the whole window at/below it as seen.
+            if (typeof v === 'number') peerSeqs[from][sid] = { last: v, mask: SEQ_MASK_ALL }
+            else peerSeqs[from][sid] = { last: v.last, mask: BigInt('0x' + (v.mask || '0')) }
+          }
+        }
+      }
     }
   } catch {}
 }
@@ -437,7 +468,14 @@ function loadReplay(): void {
 function saveReplay(): void {
   const obj: Record<string, number> = {}
   for (const [k, v] of seenMsgIds) obj[k] = v
-  safeWrite(REPLAY_FILE, JSON.stringify({ seen: obj, seqs: peerSeqs }))
+  const seqs: Record<string, Record<string, { last: number; mask: string }>> = {}
+  for (const [from, sids] of Object.entries(peerSeqs)) {
+    seqs[from] = {}
+    for (const [sid, w] of Object.entries(sids)) {
+      seqs[from][sid] = { last: w.last, mask: w.mask.toString(16) }
+    }
+  }
+  safeWrite(REPLAY_FILE, JSON.stringify({ seen: obj, seqs }))
 }
 
 // Dedup key is scoped to the SENDER so one peer cannot burn another peer's msg_id
@@ -481,14 +519,27 @@ function checkReplay(
     else writeAheadMsgId(from, msgId)
   }
 
-  // Enforce monotonic seq per (sender, session): a non-increasing seq is a replayed or
-  // reordered stale frame. Delivery is FIFO over one connection, so legitimate frames
-  // always advance. This is a real replay defense beyond the LRU/TTL-bounded msg_id set.
+  // Sliding-window seq check per (sender, session): an exact-seen or below-window seq
+  // is a replayed stale frame; an UNSEEN seq at or below `last` but inside the window
+  // is a legitimately reordered frame (e.g. an offline-queued frame drained after a
+  // newer live one) and is accepted. `seq` is covered by the signature, so an attacker
+  // cannot move a frame inside the window. This is a real replay defense beyond the
+  // LRU/TTL-bounded msg_id set — v0.2.0's strict `seq <= last` floor dropped every
+  // legitimately out-of-order frame as a replay.
   if (typeof seq === 'number' && sid) {
     if (!peerSeqs[from]) peerSeqs[from] = {}
-    const last = peerSeqs[from][sid] ?? -1
-    if (seq <= last) duplicate = true
-    else peerSeqs[from][sid] = seq
+    const w = peerSeqs[from][sid] ?? { last: -1, mask: 0n }
+    if (seq > w.last) {
+      const shift = BigInt(seq - w.last)
+      w.mask = shift >= SEQ_WINDOW ? 1n : ((w.mask << shift) | 1n) & SEQ_MASK_ALL
+      w.last = seq
+    } else {
+      const offset = BigInt(w.last - seq)
+      if (offset >= SEQ_WINDOW) duplicate = true                 // below the window: stale
+      else if ((w.mask >> offset) & 1n) duplicate = true         // exact seq already seen
+      else w.mask |= 1n << offset                                // reordered, unseen: accept
+    }
+    peerSeqs[from][sid] = w
   }
 
   return { duplicate }
@@ -518,7 +569,8 @@ const replayTimer = setInterval(() => {
 // (a) assumed a contiguous-from-0 regular-message seq stream — false, because control
 // frames (_sts/_ack/_perm) share `outboundSeq` — and (b) silently DROPPED buffered
 // frames on a 200ms timer without ever delivering them. We deliver immediately in
-// arrival order; `msg_id` dedup + the signed `seq` field remain the replay defense.
+// arrival order; `msg_id` dedup + the signed-`seq` sliding window remain the replay
+// defense, and the window tolerates reordering (relay queue drains) without dropping.
 
 // ===========================================================================
 // E2E DELIVERY ACKS
@@ -554,6 +606,31 @@ function sendAck(fromPeer: string, ackMsgId: string): void {
   const enc = encryptFor(fromPeer, `ack:${ackMsgId}`)
   if (!enc) return
   sendCtrl(fromPeer, '_ack', enc)
+}
+
+// Negative ack: a signature-verified frame arrived that we could NOT decrypt (stale
+// ciphertext — e.g. relay-queued before our reconnect regenerated the ephemeral keys).
+// Tells the sender exactly which message needs a resend instead of losing it silently.
+function sendNack(fromPeer: string, nackMsgId: string): void {
+  const enc = encryptFor(fromPeer, `nack:${nackMsgId}`)
+  if (!enc) return
+  sendCtrl(fromPeer, '_nack', enc)
+}
+
+function handleNack(nackMsgId: string, fromPeer: string): void {
+  const p = pendingAcks.get(nackMsgId)
+  // Only the peer the message was addressed to may fail it — and only while it is
+  // still tracked, so a spammy peer cannot mint notifications for arbitrary ids.
+  if (!p || p.target !== fromPeer) return
+  clearTimeout(p.timer)
+  pendingAcks.delete(nackMsgId)
+  void safeNotify({
+    method: 'notifications/claude/channel',
+    params: {
+      content: `⚠️ ${fromPeer} could NOT decrypt message ${nackMsgId} (it was encrypted to a previous session key — e.g. relay-queued while they were offline). Resend it.`,
+      meta: { type: 'delivery_failed', target: fromPeer, msg_id: nackMsgId },
+    },
+  })
 }
 
 // ===========================================================================
@@ -635,7 +712,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {
           target: { type: 'string', description: `Peer. Known: ${connectedPeers.join(', ') || '(none)'}` },
           text: { type: 'string' },
-          type: { type: 'string', enum: ['request', 'response', 'info'] },
+          type: { type: 'string', description: 'request | response | info | announcement, a custom app type, or _perm_verdict (remote permission approval). Other _-prefixed types are reserved.' },
           request_id: { type: 'string', description: 'Correlate request/response pairs' },
         },
         required: ['target', 'text'],
@@ -648,7 +725,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         type: 'object',
         properties: {
           text: { type: 'string' },
-          type: { type: 'string', enum: ['request', 'info', 'announcement'] },
+          type: { type: 'string', description: 'request | info | announcement or a custom app type (reserved _-prefixed types rejected)' },
         },
         required: ['text'],
       },
@@ -682,17 +759,21 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 
   switch (name) {
-    case 'myc_send':
-      return { content: [{ type: 'text', text: sendEncrypted(args.target, args.text, safeSendType(args.type), args.target, args.request_id) }] }
+    case 'myc_send': {
+      const sType = safeSendType(args.type)
+      if (sType === null) return { content: [{ type: 'text', text: BAD_TYPE_MSG }] }
+      return { content: [{ type: 'text', text: sendEncrypted(args.target, args.text, sType, args.request_id) }] }
+    }
 
     case 'myc_broadcast': {
       if (!connectedPeers.length) return { content: [{ type: 'text', text: 'No peers' }] }
+      const bType = safeSendType(args.type)
+      if (bType === null) return { content: [{ type: 'text', text: BAD_TYPE_MSG }] }
       // True N×unicast: each copy is routed to its specific recipient (target=p), so the
       // relay delivers exactly one decryptable ciphertext per peer. Routing target=null
       // would make the relay fan every per-recipient ciphertext to everyone, producing
       // N-1 undecryptable copies per peer. Fire-and-forget: no per-recipient ack tracking.
-      const bType = safeSendType(args.type)
-      const results = connectedPeers.map(p => sendEncrypted(p, args.text, bType, p, undefined, false))
+      const results = connectedPeers.map(p => sendEncrypted(p, args.text, bType, undefined, false))
       return { content: [{ type: 'text', text: `Broadcast (${connectedPeers.length}): ${results.join('; ')}` }] }
     }
 
@@ -719,7 +800,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         return { content: [{ type: 'text', text: `🔑 ${args.peer_name} fingerprint:\n\n  ${fp}\n\nVerify this matches the peer's fingerprint (run myc_peers on that instance).\nThen call myc_trust with confirm=true.` }] }
       }
       tofuOverride(args.peer_name, pk.sign_pubkey)
-      const session = processPeerKeys(args.peer_name, pk.sign_pubkey, pk.eph_enc_pubkey, pk.eph_enc_pubkey_sig)
+      // Explicit human override also clears an STS-failure block (same recovery path).
+      stsFailedPeers.delete(args.peer_name)
+      // session_id MUST be forwarded: the STS binding covers both session ids, so a
+      // session stored with sessionId '' can never mutually verify (v0.2.0 bug).
+      const session = processPeerKeys(args.peer_name, pk.sign_pubkey, pk.eph_enc_pubkey, pk.eph_enc_pubkey_sig, pk.session_id)
       pendingTrustKeys.delete(args.peer_name)
       return { content: [{ type: 'text', text: session ? `✅ ${args.peer_name} trusted (${fp})` : `❌ Key verification failed` }] }
     }
@@ -730,19 +815,25 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 })
 
 // Callers supply the message `type` from tool arguments (attacker-influenceable via
-// prompt injection of the local model). Restrict it to the public data types so a
-// caller cannot forge a reserved control frame (_sts_*/_ack/_perm_*) that a peer would
-// interpret as protocol traffic — e.g. a spoofed permission verdict.
-const ALLOWED_SEND_TYPES = new Set(['request', 'response', 'info', 'announcement'])
-function safeSendType(t: any): string {
-  return typeof t === 'string' && !t.startsWith('_') && ALLOWED_SEND_TYPES.has(t) ? t : 'info'
+// prompt injection of the local model). Custom application types pass through verbatim
+// (v0.1.x behavior — multi-agent workflows route on them), but reserved control frames
+// (_sts_*/_ack/_nack/_perm_req) are REJECTED WITH AN ERROR, never silently rewritten:
+// a caller must not be able to forge protocol traffic, and must not discover its type
+// was dropped only when the receiver misroutes the message. `_perm_verdict` is the one
+// sendable control type — it IS the remote permission-approval mechanism.
+function safeSendType(t: any): string | null {
+  if (t == null || t === '') return 'info'
+  if (typeof t !== 'string' || t.length > 64 || /[^\x20-\x7e]/.test(t)) return null
+  if (t.startsWith('_') && t !== '_perm_verdict') return null
+  return t
 }
+
+const BAD_TYPE_MSG = '❌ Invalid message type: reserved control types (_*) other than _perm_verdict cannot be sent, and a type must be a printable string of at most 64 chars. Use request/response/info/announcement or a custom application type.'
 
 function sendEncrypted(
   target: string,
   text: string,
   msgType: string,
-  routeTarget: string | null,
   requestId?: string,
   trackDelivery = true,
 ): string {
@@ -752,11 +843,8 @@ function sendEncrypted(
   const enc = encryptFor(target, text)
   if (!enc) return `${target} ⚠️encrypt-failed`
 
-  const msgId = sendCtrl(target, msgType, enc, {
-    target: routeTarget,
-    ...(requestId ? { request_id: requestId } : {}),
-  })
-  if (routeTarget && trackDelivery) trackAck(msgId, target)
+  const msgId = sendCtrl(target, msgType, enc, requestId ? { request_id: requestId } : undefined)
+  if (trackDelivery) trackAck(msgId, target)
   return `${target} 🔒${s.tofuStatus === 'new' ? '🆕' : ''}`
 }
 
@@ -802,8 +890,25 @@ async function processRegularMessage(msg: any): Promise<void> {
   const { duplicate } = checkReplay(msg.from, msg.msg_id, msg.seq, msg.session_id)
   if (duplicate) { log(`Replay BLOCKED: dup/stale-seq ${msg.msg_id} from ${msg.from}`); return }
 
+  // Decrypt failure on a VERIFIED frame = stale ciphertext (peer sent it before we
+  // reconnected and rotated ephemeral keys) or corruption. The frame's origin and
+  // msg_id are authenticated, so surface a FIXED-TEXT loss signal (no attacker-
+  // controlled content reaches the model) and nack the sender so it can resend —
+  // v0.2.0 dropped these with only a stderr log, silently losing every relay-queued
+  // message.
   const content = decryptFrom(msg.from, msg.encrypted, msg.nonce)
-  if (content == null) { log(`🔴 BLOCKED: decrypt failed from ${msg.from}`); return }
+  if (content == null) {
+    log(`🔴 decrypt failed from ${msg.from} (stale session ciphertext?) — nacking ${msg.msg_id}`)
+    if (msg.msg_id) sendNack(msg.from, msg.msg_id)
+    await safeNotify({
+      method: 'notifications/claude/channel',
+      params: {
+        content: `⚠️ Undecryptable message from ${msg.from} (id ${msg.msg_id ?? 'unknown'}) — encrypted to a previous session key, likely relay-queued while this peer was offline. The sender has been asked to resend.`,
+        meta: { type: 'decrypt_failed', from_peer: msg.from, msg_id: msg.msg_id ?? '' },
+      },
+    })
+    return
+  }
 
   const session = peerSessions.get(msg.from)
   const tofu = session ? (session.tofuStatus === 'new' ? '🆕' : '🔒') : '🔴'
@@ -932,13 +1037,13 @@ function connectRelay(): void {
       reconnectAttempt = 0
       peerSessions.clear()
       pendingTrustKeys.clear()
-      // A new session (new sessionId + reset outboundSeq) invalidates prior per-session
-      // state. Clear stale timers so they can't fire spurious "delivery NOT confirmed"
-      // notifications or delete freshly-established STS state.
+      // A new session invalidates prior STS handshake state — clear those timers so
+      // they can't delete freshly-established STS state. pendingAcks timers are KEPT:
+      // a message that raced the disconnect genuinely has unconfirmed delivery, and
+      // the 30s watchdog is the sender's only loss signal for it. (If the ack still
+      // arrives after we reconnect, handleAck clears the timer as usual.)
       for (const [, p] of stsPending) clearTimeout(p.timer)
       stsPending.clear()
-      for (const [, p] of pendingAcks) clearTimeout(p.timer)
-      pendingAcks.clear()
 
       if (msg.payload?.peers) {
         for (const [n, info] of Object.entries(msg.payload.peers) as [string, any][]) {
@@ -1018,7 +1123,41 @@ function connectRelay(): void {
         return
       }
 
-      if (msg.type === 'queued') return
+      // Relay delivery-status frames. The relay reports drops honestly (rate limit,
+      // backpressure, queue full) and deferred delivery ('queued') — swallowing them
+      // here (as v0.2.0 did for 'error') silently re-hides exactly the losses the
+      // relay-side truth-telling exists to expose. Relay text is infrastructure
+      // status, not peer content — sanitize + truncate before surfacing.
+      if (msg.type === 'queued' || msg.type === 'error') {
+        const detail = String(msg.payload ?? '').replace(/[\r\n]+/g, ' ').slice(0, 160)
+        if (msg.type === 'error') {
+          log(`Relay error: ${detail} (msg ${msg.msg_id ?? '?'})`)
+          // Fail fast: the relay just told us this message was dropped — no point
+          // letting the 30s ack watchdog keep pretending it might arrive.
+          const p = msg.msg_id ? pendingAcks.get(msg.msg_id) : undefined
+          if (p) {
+            clearTimeout(p.timer)
+            pendingAcks.delete(msg.msg_id)
+          }
+          await safeNotify({
+            method: 'notifications/claude/channel',
+            params: {
+              content: `⚠️ Relay reports delivery failure${p ? ` to ${p.target}` : ''}: ${detail} (msg ${msg.msg_id ?? 'unknown'}). The message was NOT delivered — resend it.`,
+              meta: { type: 'relay_error', msg_id: msg.msg_id ?? '', ...(p ? { target: p.target } : {}) },
+            },
+          })
+        } else {
+          log(`Relay queued: ${detail} (msg ${msg.msg_id ?? '?'})`)
+          await safeNotify({
+            method: 'notifications/claude/channel',
+            params: {
+              content: `⏳ Relay: ${detail} (msg ${msg.msg_id ?? 'unknown'}). The message was queued for an offline peer — it will NOT be decryptable after they reconnect (their session keys rotate), so expect a resend request when they return.`,
+              meta: { type: 'relay_queued', msg_id: msg.msg_id ?? '' },
+            },
+          })
+        }
+        return
+      }
       return
     }
 
@@ -1027,6 +1166,14 @@ function connectRelay(): void {
       if (msg.e2e && msg.encrypted && msg.nonce) {
         const dec = decryptFrom(msg.from, msg.encrypted, msg.nonce)
         if (dec?.startsWith('ack:')) handleAck(dec.slice(4), msg.from)
+      }
+      return
+    }
+
+    if (msg.type === '_nack') {
+      if (msg.e2e && msg.encrypted && msg.nonce) {
+        const dec = decryptFrom(msg.from, msg.encrypted, msg.nonce)
+        if (dec?.startsWith('nack:')) handleNack(dec.slice(5), msg.from)
       }
       return
     }
@@ -1078,6 +1225,8 @@ function connectRelay(): void {
       }
       const dec = decryptFrom(msg.from, msg.encrypted, msg.nonce)
       if (!dec) return
+      // Verdicts are sent via myc_send (ack-tracked) — confirm delivery to the approver.
+      if (msg.msg_id) sendAck(msg.from, msg.msg_id)
       try {
         const v = JSON.parse(dec)
         await safeNotify({

@@ -9,6 +9,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Nothing yet. New entries land here between releases._
 
+## [0.2.1] - 2026-07-18
+
+Loss-signal release. A post-merge audit of 0.2.0 confirmed that several of its
+hardening changes traded v0.1.x's noisy failures for **silent message loss** and
+un-surfaced security failures. Every confirmed finding is fixed here, each with a
+regression test in the two-peer integration suite or the controlled-relay suite.
+
+### Fixed
+
+- **HIGH — offline-queued messages were silently lost.** A relay-queued frame is
+  encrypted to the recipient's *previous* ephemeral key (keys rotate on every
+  reconnect), so it can never be decrypted on delivery — and 0.2.0 hard-dropped it
+  with only a stderr log. A verified-but-undecryptable frame now (a) surfaces a
+  fixed-text loss notification to the recipient's model (no attacker-controlled
+  content) and (b) sends an encrypted `_nack` to the sender, whose model is told
+  exactly which `msg_id` needs a resend. The relay's `queued` status is also
+  surfaced to the sender with an honest warning that queued frames will not be
+  decryptable after the peer reconnects.
+- **HIGH — legitimately reordered frames were dropped as replays.** The strict
+  monotonic `seq <= last ⇒ duplicate` check discarded any out-of-order frame
+  pre-decryption. Replaced with an RFC 4303-style sliding window (64 entries) per
+  (sender, session): unseen seqs inside the window are delivered even below the
+  floor, exact replays and below-window stale frames are still rejected, and `seq`
+  remains signature-covered so frames cannot be moved. Persisted replay state
+  migrates from the 0.2.0 format conservatively.
+- **HIGH — relay delivery-error reports were swallowed by the client.** 0.2.0 made
+  the relay report drops honestly (`rate limited`, `backpressured`, `queue full`),
+  but the peer's `_relay` handler discarded `error` frames unseen. They now surface
+  to the model (sanitized + truncated), and a reported drop fails the pending
+  delivery ack immediately instead of waiting out the 30s watchdog.
+- **HIGH — reconnect cancelled genuine delivery warnings.** The `auth_ok` handler
+  cleared all `pendingAcks` timers, so a message that raced a disconnect lost its
+  only loss signal. Ack timers now survive reconnects; the 30s watchdog fires
+  unless a real ack arrives.
+- **HIGH — STS never verified for manually trusted peers.** `myc_trust` re-processed
+  peer keys without the stored `session_id`, so the session-id-bound STS binding
+  could never match and mutual verification permanently failed for exactly the
+  peers the user explicitly trusted. The `session_id` is now forwarded.
+- **MEDIUM — custom message types were silently rewritten to `info`.** 0.2.0's
+  `safeSendType` coerced any non-allowlisted type, breaking v0.1.x workflows that
+  route on `meta.type` and severing the `_perm_verdict` remote-approval loop.
+  Custom application types now pass through verbatim; reserved `_*` control types
+  are rejected with an explicit tool error (never silently rewritten); and
+  `_perm_verdict` — the remote permission-approval mechanism — is sendable again
+  (and now delivery-acked by the receiver).
+- **MEDIUM — STS verification failure was log-only.** A wrong STS binding signature
+  (possible MITM) left messages flowing with a `🔒` indicator. A binding-signature
+  mismatch is now fail-closed: the session is torn down, the peer is blocked (also
+  across re-key attempts), the model gets a `🔴 possible MITM` notification, and
+  recovery requires out-of-band fingerprint verification + `myc_trust`. STS
+  *timeout* remains lenient (TOFU/eph-sig-authenticated, no 🤝 flag). Malformed
+  STS signatures can no longer throw in the handshake handlers.
+
+### Changed
+
+- The canonical 11-field signature serialization now lives in `canonical.ts` and is
+  imported by `peer-channel.ts` **and** the tests — previously three inline copies
+  could drift and let tests verify themselves instead of the protocol.
+- `sendEncrypted` lost its vestigial `routeTarget` parameter (it was always equal to
+  `target`), making the v0.1.x `target=null` broadcast fan-out bug unrepresentable.
+- Shared test plumbing (MCP stdio client + `waitUntil`) extracted to
+  `test-helpers.ts`, used by both process-spawning suites.
+
+### Added
+
+- Integration tests: custom type delivered verbatim; reserved types rejected with an
+  explicit error; full TOFU-key-change → `myc_trust` → STS-re-verification walk.
+- Controlled-relay tests: out-of-order delivery inside the window; exact-replay
+  rejection; decrypt-failure notification + `_nack` round-trip (both sides);
+  relay `error`/`queued` surfacing; STS fail-closed teardown.
+
 ## [0.2.0] - 2026-07-17
 
 Correctness release. v0.1.x could not deliver a single message between two peers;

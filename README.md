@@ -45,10 +45,10 @@ Mycelium is a zero-trust messaging layer for Claude Code. The relay routes ciphe
 - **Signatures**: Ed25519 detached, over canonical JSON (sorted keys, 11 fields including msg_id + seq + request_id)
 - **Authenticated key exchange**: each ephemeral Curve25519 key is signed by the peer's Ed25519 identity (`eph_enc_pubkey_sig`), so the relay cannot substitute it. This is what makes the DH exchange MITM-resistant.
 - **Identity pinning**: TOFU fail-closed. First-contact assurance via out-of-band fingerprint verification (`myc_trust`).
-- **Session confirmation**: STS-style mutual handshake binding both session ephemerals + both session_ids, signed with the identity keys — a live, mutual confirmation on top of the signed key exchange. Never tears the session down on mismatch.
+- **Session confirmation**: STS-style mutual handshake binding both session ephemerals + both session_ids, signed with the identity keys — a live, mutual confirmation on top of the signed key exchange. Timeout is lenient (channel stays TOFU/eph-sig authenticated); a wrong binding signature is fail-closed — session torn down, peer blocked until `myc_trust`.
 - **Relay authentication**: Ed25519 challenge-response. Token is a one-time invite; known peers auth via cryptographic identity.
 - **Relay identity**: Relay has its own Ed25519 keypair. Peers verify fingerprint before sending credentials.
-- **Replay protection**: msg_id dedup (write-ahead log) + in-order delivery + 30min time-based expiry
+- **Replay protection**: msg_id dedup (write-ahead log) + signed-`seq` sliding window per (sender, session) + 30min time-based expiry
 - **Broadcast**: N x unicast (each peer gets independently encrypted copy)
 
 ## Setup
@@ -145,7 +145,7 @@ Mycelium addresses the full spectrum of relay-trust vulnerabilities:
 |---|---|
 | Shared-token auth | Ed25519 challenge-response. Token is a one-time invite; known peers auth via cryptographic identity. |
 | Timing side-channels | libsodium WASM with audited constant-time operations. |
-| Message reordering | FIFO delivery over a single relay connection + signed monotonic `seq` (non-increasing = rejected as replay). |
+| Message reordering | FIFO delivery over a single relay connection + signed `seq` anti-replay window (RFC 4303 style): reordered frames inside the window are delivered, exact replays and below-window stale frames are rejected. |
 | Single point of failure | Multi-relay client failover via comma-separated `MYC_RELAY` URLs. |
 | First-contact MITM | TOFU on first use + out-of-band fingerprint verification (`myc_trust`); STS session-confirmation binds the agreed keys thereafter. |
 | Relay impersonation | Relay Ed25519 identity verification + sealed (encrypted) auth tokens. |

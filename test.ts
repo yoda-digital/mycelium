@@ -3,6 +3,7 @@
  * Mycelium test suite — infrastructure + crypto protocol.
  */
 import sodium from 'libsodium-wrappers-sumo'
+import { canonicalize } from './canonical.ts'
 await sodium.ready
 
 const toB64 = (x: Uint8Array) => sodium.to_base64(x, sodium.base64_variants.ORIGINAL)
@@ -340,19 +341,11 @@ try {
       e2e: true, encrypted: 'abc', msg_id: 'id-1', nonce: 'xyz',
       payload: null, request_id: null, sender: 'alice', seq: 7, session_id: 's1', target: 'bob', type: 'info',
     }
-    const canonical = JSON.stringify(body) // already sorted by key in object literal above
+    const canonical = canonicalize(body)
     const sig = sodium.crypto_sign_detached(sodium.from_string(canonical), kp.privateKey)
 
     // Relay tries to replay with new msg_id and seq
-    const tampered = { ...body, msg_id: 'id-99', seq: 99 }
-    const tampCanon = JSON.stringify({
-      e2e: tampered.e2e, encrypted: tampered.encrypted,
-      msg_id: tampered.msg_id, nonce: tampered.nonce,
-      payload: tampered.payload, request_id: tampered.request_id,
-      sender: tampered.sender,
-      seq: tampered.seq, session_id: tampered.session_id,
-      target: tampered.target, type: tampered.type,
-    })
+    const tampCanon = canonicalize({ ...body, msg_id: 'id-99', seq: 99 })
     assert(!sodium.crypto_sign_verify_detached(sig, sodium.from_string(tampCanon), kp.publicKey), 'relay replay with new IDs FAILS sig')
 
     // Original passes
@@ -505,19 +498,11 @@ try {
       e2e: true, encrypted: 'data', msg_id: 'orig-1', nonce: 'n1',
       payload: null, request_id: null, sender: 'alice', seq: 0, session_id: 'sess1', target: 'bob', type: 'info',
     }
-    const canonical = JSON.stringify(origMsg)
+    const canonical = canonicalize(origMsg)
     const sig = sodium.crypto_sign_detached(sodium.from_string(canonical), signKP.privateKey)
 
     // Relay intercepts, changes msg_id to bypass dedup
-    const relayMsg = { ...origMsg, msg_id: 'relay-forged-99', seq: 999 }
-    const relayCanonical = JSON.stringify({
-      e2e: relayMsg.e2e, encrypted: relayMsg.encrypted,
-      msg_id: relayMsg.msg_id, nonce: relayMsg.nonce,
-      payload: relayMsg.payload, request_id: relayMsg.request_id,
-      sender: relayMsg.sender,
-      seq: relayMsg.seq, session_id: relayMsg.session_id,
-      target: relayMsg.target, type: relayMsg.type,
-    })
+    const relayCanonical = canonicalize({ ...origMsg, msg_id: 'relay-forged-99', seq: 999 })
 
     // Receiver verifies: MUST FAIL because msg_id and seq are now in canonical
     assert(!sodium.crypto_sign_verify_detached(sig, sodium.from_string(relayCanonical), signKP.publicKey), 'forged msg_id+seq breaks sig ✓')
@@ -528,15 +513,10 @@ try {
   console.log('\n=== L3: request_id is covered by the canonical signature ===')
   {
     const kp = sodium.crypto_sign_keypair()
-    const canon = (m: any) => JSON.stringify({
-      e2e: m.e2e, encrypted: m.encrypted, msg_id: m.msg_id, nonce: m.nonce,
-      payload: m.payload, request_id: m.request_id, sender: m.sender, seq: m.seq,
-      session_id: m.session_id, target: m.target, type: m.type,
-    })
     const base = { e2e: true, encrypted: 'e', msg_id: 'm', nonce: 'n', payload: null, request_id: 'r1', sender: 'a', seq: 0, session_id: 's', target: 'b', type: 'info' }
-    const sig = sodium.crypto_sign_detached(sodium.from_string(canon(base)), kp.privateKey)
-    assert(sodium.crypto_sign_verify_detached(sig, sodium.from_string(canon(base)), kp.publicKey), 'L3: original request_id verifies')
-    assert(!sodium.crypto_sign_verify_detached(sig, sodium.from_string(canon({ ...base, request_id: 'r2' })), kp.publicKey), 'L3: tampering request_id breaks the sig')
+    const sig = sodium.crypto_sign_detached(sodium.from_string(canonicalize(base)), kp.privateKey)
+    assert(sodium.crypto_sign_verify_detached(sig, sodium.from_string(canonicalize(base)), kp.publicKey), 'L3: original request_id verifies')
+    assert(!sodium.crypto_sign_verify_detached(sig, sodium.from_string(canonicalize({ ...base, request_id: 'r2' })), kp.publicKey), 'L3: tampering request_id breaks the sig')
   }
 
   console.log('\n=== L4: Multi-relay failover ===')

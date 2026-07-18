@@ -336,7 +336,7 @@ Each relay is independent — no inter-relay coordination. The peer re-authentic
 bun run test.ts
 ```
 
-Expected: `75 passed, 0 failed`. Tests spawn their own relay instance — no external dependencies.
+Expected: `0 failed` (76 unit tests). Run `bun run test` for the full suite — unit + two-peer integration + controlled-relay protocol regressions. Tests spawn their own relay instances — no external dependencies.
 
 ### Health check (relay)
 

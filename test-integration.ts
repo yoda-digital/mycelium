@@ -13,6 +13,7 @@ import { mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import sodium from 'libsodium-wrappers-sumo'
+import { PeerProc, waitUntil } from './test-helpers.ts'
 
 await sodium.ready
 const toB64 = (x: Uint8Array) => sodium.to_base64(x, sodium.base64_variants.ORIGINAL)
@@ -20,6 +21,7 @@ const toB64 = (x: Uint8Array) => sodium.to_base64(x, sodium.base64_variants.ORIG
 const REPO = import.meta.dir
 const PORT = 9902
 const TOKEN = 'itest-' + Date.now()
+const RELAY_URL = `ws://127.0.0.1:${PORT}`
 const SCRATCH = mkdtempSync(join(tmpdir(), 'myc-itest-'))
 
 let passed = 0
@@ -29,104 +31,8 @@ function assert(cond: boolean, name: string): void {
   else { failed++; console.error(`  ❌ ${name}`) }
 }
 
-// --- MCP stdio client over a spawned peer-channel process ---
-class Peer {
-  proc: any
-  name: string
-  private buf = ''
-  private nextId = 1
-  private pending = new Map<number, (v: any) => void>()
-  channelMsgs: any[] = []
-  stderr: string[] = []
-
-  constructor(name: string) {
-    this.name = name
-    this.proc = Bun.spawn(['bun', 'run', 'peer-channel.ts'], {
-      cwd: REPO,
-      env: {
-        ...process.env,
-        MYC_RELAY: `ws://127.0.0.1:${PORT}`,
-        MYC_TOKEN: TOKEN,
-        MYC_PEER: name,
-        MYC_ROOM: 'default',
-        MYC_KEY_FILE: join(SCRATCH, `${name}-keys.json`),
-        MYC_TOFU_FILE: join(SCRATCH, `${name}-tofu.json`),
-        MYC_REPLAY_FILE: join(SCRATCH, `${name}-replay.json`),
-      },
-      stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
-    })
-    this.readStdout()
-    this.readStderr()
-  }
-
-  private async readStdout(): Promise<void> {
-    const reader = this.proc.stdout.getReader()
-    const dec = new TextDecoder()
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      this.buf += dec.decode(value, { stream: true })
-      let idx: number
-      while ((idx = this.buf.indexOf('\n')) >= 0) {
-        const line = this.buf.slice(0, idx).trim()
-        this.buf = this.buf.slice(idx + 1)
-        if (!line) continue
-        let msg: any
-        try { msg = JSON.parse(line) } catch { continue }
-        if (msg.id !== undefined && this.pending.has(msg.id)) {
-          this.pending.get(msg.id)!(msg)
-          this.pending.delete(msg.id)
-        } else if (msg.method === 'notifications/claude/channel') {
-          this.channelMsgs.push(msg.params)
-        }
-      }
-    }
-  }
-
-  private async readStderr(): Promise<void> {
-    const reader = this.proc.stderr.getReader()
-    const dec = new TextDecoder()
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      for (const l of dec.decode(value, { stream: true }).split('\n')) {
-        if (l.trim()) this.stderr.push(l.trim())
-      }
-    }
-  }
-
-  private send(obj: any): void { this.proc.stdin.write(JSON.stringify(obj) + '\n'); this.proc.stdin.flush?.() }
-
-  request(method: string, params: any): Promise<any> {
-    const id = this.nextId++
-    return new Promise((resolve) => {
-      this.pending.set(id, resolve)
-      this.send({ jsonrpc: '2.0', id, method, params })
-    })
-  }
-
-  async initialize(): Promise<void> {
-    await this.request('initialize', {
-      protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'itest', version: '1.0.0' },
-    })
-    this.send({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} })
-  }
-
-  callTool(name: string, args: any): Promise<any> { return this.request('tools/call', { name, arguments: args }) }
-  toolText(res: any): string { return res?.result?.content?.[0]?.text ?? '' }
-  stderrHas(re: RegExp): boolean { return this.stderr.some(l => re.test(l)) }
-  from(peer: string): any[] { return this.channelMsgs.filter(m => m.meta?.from_peer === peer) }
-  clear(): void { this.channelMsgs = [] }
-  kill(): void { try { this.proc.kill() } catch {} }
-}
-
-async function waitUntil(fn: () => boolean, timeoutMs: number, stepMs = 50): Promise<boolean> {
-  const start = Date.now()
-  while (Date.now() - start < timeoutMs) {
-    if (fn()) return true
-    await Bun.sleep(stepMs)
-  }
-  return fn()
+function spawnPeer(name: string, filePrefix?: string): PeerProc {
+  return new PeerProc({ name, relayUrl: RELAY_URL, token: TOKEN, scratchDir: SCRATCH, filePrefix })
 }
 
 // A raw relay client (not a peer-channel) that authenticates via challenge-response and
@@ -173,15 +79,16 @@ const relay = Bun.spawn(['bun', 'run', 'relay.ts'], {
   stdout: 'pipe', stderr: 'pipe',
 })
 
-let alice!: Peer
-let bob!: Peer
+let alice!: PeerProc
+let bob!: PeerProc
+let bob2: PeerProc | undefined
 try {
   await Bun.sleep(900)
 
   console.log('\n🌱 IT1: two real peers authenticate + STS mutually verify')
-  alice = new Peer('alice')
+  alice = spawnPeer('alice')
   await alice.initialize()
-  bob = new Peer('bob')
+  bob = spawnPeer('bob')
   await bob.initialize()
 
   assert(await waitUntil(() => alice.stderrHas(/Auth OK/) && bob.stderrHas(/Auth OK/), 6000), 'both peers authenticated to relay')
@@ -247,12 +154,54 @@ try {
   assert(injected.length === 0, 'plaintext injection not delivered to the model')
   assert(bob.stderrHas(/non-E2E peer message/), 'receiver logged the block')
 
+  console.log('\n🏷️ IT9: custom message type is delivered verbatim (not coerced to info)')
+  // v0.2.0 regression: safeSendType silently rewrote custom types to 'info', breaking
+  // every v0.1.x workflow that routes on meta.type.
+  bob.clear()
+  const ctRes = alice.toolText(await alice.callTool('myc_send', { target: 'bob', text: 'CUSTOM-TYPE', type: 'task_result' }))
+  assert(ctRes.includes('🔒'), `custom-type send accepted (${ctRes.trim()})`)
+  await waitUntil(() => bob.from('alice').some(m => m.content === 'CUSTOM-TYPE'), 3000)
+  const ctMsg = bob.from('alice').find(m => m.content === 'CUSTOM-TYPE')
+  assert(ctMsg?.meta?.type === 'task_result', `custom type preserved on delivery (got ${ctMsg?.meta?.type})`)
+
+  console.log('\n🚫 IT10: reserved control types are rejected with an explicit error')
+  const resAck = alice.toolText(await alice.callTool('myc_send', { target: 'bob', text: 'x', type: '_ack' }))
+  assert(resAck.includes('❌ Invalid message type'), 'sending type _ack returns an explicit error (not silent coercion)')
+  const resSts = alice.toolText(await alice.callTool('myc_send', { target: 'bob', text: 'x', type: '_sts_init' }))
+  assert(resSts.includes('❌ Invalid message type'), 'sending type _sts_init returns an explicit error')
+
+  console.log('\n🔑 IT11: TOFU key change → myc_trust → STS re-verifies (session_id forwarded)')
+  // v0.2.0 regression: myc_trust dropped the session_id, so STS could never verify for
+  // a manually trusted peer. This restarts "bob" with a NEW identity, walks the trust
+  // flow, and requires full mutual STS verification + working delivery afterwards.
+  bob.kill()
+  await Bun.sleep(600) // let the relay reap bob and alice process peer_left
+  const stsBefore = alice.stderr.filter(l => /STS verified: bob/.test(l)).length
+  alice.clear()
+  bob2 = spawnPeer('bob', 'bob2') // same name, fresh keys → TOFU 'changed' at alice
+  await bob2.initialize()
+  assert(await waitUntil(() => alice.stderrHas(/TOFU VIOLATION: bob/), 6000), 'alice detects the key change (TOFU violation)')
+  const blockedTxt = alice.toolText(await alice.callTool('myc_send', { target: 'bob', text: 'nope' }))
+  assert(blockedTxt.includes('BLOCKED'), 'sends to the changed-key peer are blocked before trust')
+  const fpTxt = alice.toolText(await alice.callTool('myc_trust', { peer_name: 'bob' }))
+  assert(fpTxt.includes('fingerprint'), 'myc_trust shows the fingerprint first')
+  const trustTxt = alice.toolText(await alice.callTool('myc_trust', { peer_name: 'bob', confirm: true }))
+  assert(trustTxt.includes('✅'), `myc_trust confirm succeeds (${trustTxt.trim()})`)
+  const stsAgain = await waitUntil(() => alice.stderr.filter(l => /STS verified: bob/.test(l)).length > stsBefore, 6000)
+  assert(stsAgain, 'STS mutually verifies AFTER myc_trust (session_id was forwarded)')
+  const peersTrusted = alice.toolText(await alice.callTool('myc_peers', {}))
+  assert(/bob.*🤝/.test(peersTrusted), `myc_peers shows 🤝 for the trusted peer (${peersTrusted.trim()})`)
+  bob2.clear()
+  await alice.callTool('myc_send', { target: 'bob', text: 'POST-TRUST', type: 'info' })
+  assert(await waitUntil(() => bob2!.from('alice').some(m => m.content === 'POST-TRUST'), 3000), 'delivery works after trust')
+
 } catch (e) {
   console.error('\n💥 Integration error:', e)
   failed++
 } finally {
   try { alice?.kill() } catch {}
   try { bob?.kill() } catch {}
+  try { bob2?.kill() } catch {}
   try { relay.kill() } catch {}
   await Bun.sleep(150)
   try { rmSync(SCRATCH, { recursive: true, force: true }) } catch {}

@@ -1,6 +1,6 @@
 {
   "name": "@yoda.digital/mycelium",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "End-to-end encrypted messaging between Claude Code instances. Curve25519 PFS, Ed25519 TOFU, replay protection, stateless relay.",
   "type": "module",
   "bin": {
