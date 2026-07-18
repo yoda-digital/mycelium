@@ -33,6 +33,7 @@
     "test:poison": "bun run test-replay-poison.ts",
     "test:durability": "bun run test-durability.ts",
     "test:node": "bun run test-node-smoke.ts",
+    "test:prod": "bun run test-prod-e2e.ts",
     "typecheck": "bunx tsc --noEmit",
     "demo": "bun run demo.ts",
     "relay": "bun run relay.ts",

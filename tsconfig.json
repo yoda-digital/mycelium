@@ -16,6 +16,6 @@
     "noImplicitAny": false,
     "types": ["bun"]
   },
-  "include": ["relay.ts", "peer-channel.ts", "canonical.ts", "test.ts", "test-integration.ts", "test-replay-poison.ts", "test-helpers.ts", "test-durability.ts", "test-node-smoke.ts", "demo.ts"],
+  "include": ["relay.ts", "peer-channel.ts", "canonical.ts", "test.ts", "test-integration.ts", "test-replay-poison.ts", "test-helpers.ts", "test-durability.ts", "test-node-smoke.ts", "test-prod-e2e.ts", "demo.ts"],
   "exclude": ["node_modules", "build", "coverage", "docs"]
 }
