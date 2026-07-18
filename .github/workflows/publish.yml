@@ -25,7 +25,7 @@ jobs:
       name: npm
       url: https://www.npmjs.com/package/@yoda.digital/mycelium
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -38,7 +38,7 @@ jobs:
       # Node 24 ships with npm 11+ natively. OIDC trusted publishing requires
       # npm >= 11.5.1. We deliberately use 24 here (not the .nvmrc-pinned
       # value) because the toolcache npm 10.x cannot self-upgrade reliably.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
