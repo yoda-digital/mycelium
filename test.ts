@@ -10,6 +10,8 @@ const toB64 = (x: Uint8Array) => sodium.to_base64(x, sodium.base64_variants.ORIG
 const fromB64 = (x: string) => sodium.from_base64(x, sodium.base64_variants.ORIGINAL)
 
 const TOKEN = 'test-' + Date.now()
+const ADMIN_TOKEN = 'admin-' + Date.now()
+const HEALTH_TOKEN = 'health-' + Date.now()
 const PORT = 9901
 let passed = 0
 let failed = 0
@@ -137,6 +139,8 @@ let relay = Bun.spawn(['bun', 'run', 'relay.ts'], {
   env: {
     ...process.env,
     RELAY_TOKEN: TOKEN,
+    RELAY_ADMIN_TOKEN: ADMIN_TOKEN,
+    RELAY_HEALTH_TOKEN: HEALTH_TOKEN,
     RELAY_PORT: String(PORT),
     RELAY_MAX_PEERS: '5',
     RELAY_MAX_MSG_BYTES: '4096',
@@ -273,10 +277,11 @@ try {
   await consumeN(a2, 1)
   assert(!!b3.postAuthMsgs?.find((m: any) => m.payload === 'queued'), 'drained')
 
-  console.log('\n🏥 T10: Health auth')
+  console.log('\n🏥 T10: Health auth (split from the invite token)')
   assert((await fetch(`http://127.0.0.1:${PORT}/health`)).status === 401, 'no auth 401')
-  const h = await fetch(`http://127.0.0.1:${PORT}/health`, { headers: { Authorization: `Bearer ${TOKEN}` } })
-  assert(h.status === 200, 'bearer 200')
+  assert((await fetch(`http://127.0.0.1:${PORT}/health`, { headers: { Authorization: `Bearer ${TOKEN}` } })).status === 401, 'invite token is NOT a health credential')
+  const h = await fetch(`http://127.0.0.1:${PORT}/health`, { headers: { Authorization: `Bearer ${HEALTH_TOKEN}` } })
+  assert(h.status === 200, 'health token 200')
   assert(typeof ((await h.json()) as any).memory?.rss_mb === 'number', 'has memory')
 
   console.log('\n💓 T11: Ping/pong')
@@ -297,6 +302,8 @@ try {
     env: {
       ...process.env,
       RELAY_TOKEN: TOKEN,
+      RELAY_ADMIN_TOKEN: ADMIN_TOKEN,
+      RELAY_HEALTH_TOKEN: HEALTH_TOKEN,
       RELAY_PORT: String(PORT),
       RELAY_MAX_PEERS: '10',
       RELAY_PING_INTERVAL: '30',
@@ -679,7 +686,7 @@ try {
   {
     const victimKey = toB64(signKPCache.get('squat-victim').publicKey)
     const rev = await fetch(`http://127.0.0.1:${PORT}/admin/revoke`, {
-      method: 'POST', headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
+      method: 'POST', headers: { Authorization: `Bearer ${ADMIN_TOKEN}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ room: 'default', name: 'squat-victim' }),
     })
     assert(rev.status === 200 && ((await rev.json()) as any).revoked === true, 'revoke by name succeeds')
@@ -690,7 +697,7 @@ try {
       assert(/revoked/.test(e.message), 'revoked key rejected even with a valid token')
     }
     const undo = await fetch(`http://127.0.0.1:${PORT}/admin/revoke`, {
-      method: 'POST', headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
+      method: 'POST', headers: { Authorization: `Bearer ${ADMIN_TOKEN}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ room: 'default', pubkey: victimKey, undo: true }),
     })
     assert(undo.status === 200 && ((await undo.json()) as any).revoked === true, 'undo removes the blocklist entry')
@@ -698,7 +705,11 @@ try {
     assert(back.readyState === WebSocket.OPEN, 'un-revoked key re-registers with the token')
     back.close()
     const noAuth = await fetch(`http://127.0.0.1:${PORT}/admin/revoke`, { method: 'POST', body: '{}' })
-    assert(noAuth.status === 401, 'admin endpoints require the bearer token')
+    assert(noAuth.status === 401, 'admin endpoints reject no-auth')
+    const inviteTok = await fetch(`http://127.0.0.1:${PORT}/admin/revoke`, {
+      method: 'POST', headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' }, body: '{}',
+    })
+    assert(inviteTok.status === 401, 'the invite token is NOT an admin credential (an invited peer cannot revoke/inspect)')
   }
 
   console.log('\n=== Room discovery: list_rooms over the authenticated channel ===')

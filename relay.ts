@@ -44,7 +44,11 @@ const PING_INTERVAL_S = Number(process.env.RELAY_PING_INTERVAL ?? 30)
 const RATE_LIMIT = Number(process.env.RELAY_RATE_LIMIT ?? 300)
 const QUEUE_MAX_MSGS = Number(process.env.RELAY_QUEUE_MAX_MSGS ?? 50)
 const QUEUE_MAX_BYTES = Number(process.env.RELAY_QUEUE_MAX_BYTES ?? 524_288)
-const QUEUE_TTL_S = Number(process.env.RELAY_QUEUE_TTL_S ?? 300)
+// Default raised 300→3600 to match the peer's default MYC_OFFLINE_MAX_AGE_S (3600).
+// If the relay drops queued mail before the sender's offline-ack window closes, the
+// sender is told "FAILED" long after the message silently expired. Keep this >= the
+// peers' MYC_OFFLINE_MAX_AGE_S.
+const QUEUE_TTL_S = Number(process.env.RELAY_QUEUE_TTL_S ?? 3600)
 const MAX_IP_CONNS = Number(process.env.RELAY_MAX_IP_CONNS ?? 10)
 const AUTH_TIMEOUT_MS = Number(process.env.RELAY_AUTH_TIMEOUT_MS ?? 5000)
 const REQUIRE_TLS = process.env.RELAY_REQUIRE_TLS === 'true'
@@ -55,6 +59,23 @@ const REQUIRE_CHALLENGE = process.env.RELAY_REQUIRE_CHALLENGE === 'true'
 const DISCOVERY = process.env.RELAY_DISCOVERY !== 'false'
 const KEY_PASSPHRASE = process.env.RELAY_KEY_PASSPHRASE
 const MAX_ROOMS_PER_CONN = 8
+// Admin/health are split off the invite TOKEN so an invited peer can no longer read
+// the social graph or revoke others. If RELAY_ADMIN_TOKEN is unset, admin is loopback-
+// only (local operator); the long-lived invite TOKEN is NEVER an admin credential.
+const ADMIN_TOKEN = process.env.RELAY_ADMIN_TOKEN
+const HEALTH_TOKEN = process.env.RELAY_HEALTH_TOKEN
+
+function isLoopback(ip: string): boolean {
+  return ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1' || ip === 'localhost'
+}
+function adminAuthorized(req: Request, ip: string): boolean {
+  if (ADMIN_TOKEN) return ctEq(req.headers.get('authorization'), `Bearer ${ADMIN_TOKEN}`)
+  return isLoopback(ip)
+}
+function healthAuthorized(req: Request, ip: string): boolean {
+  if (HEALTH_TOKEN) return ctEq(req.headers.get('authorization'), `Bearer ${HEALTH_TOKEN}`)
+  return adminAuthorized(req, ip)
+}
 
 if (!TOKEN) {
   console.error('RELAY_TOKEN required')
@@ -553,9 +574,10 @@ const server = Bun.serve<WsData>({
   port: PORT,
   fetch(req, server) {
     const url = new URL(req.url)
+    const ip = resolveIp(req, server)
 
     if (url.pathname === '/health') {
-      if (!ctEq(req.headers.get('authorization'), `Bearer ${TOKEN}`)) {
+      if (!healthAuthorized(req, ip)) {
         return new Response('unauthorized', { status: 401 })
       }
       const m = process.memoryUsage()
@@ -572,13 +594,13 @@ const server = Bun.serve<WsData>({
 
     // Admin: allow-list inspection + revocation (replaces "edit the JSON by hand").
     if (url.pathname === '/admin/allowlist') {
-      if (!ctEq(req.headers.get('authorization'), `Bearer ${TOKEN}`)) {
+      if (!adminAuthorized(req, ip)) {
         return new Response('unauthorized', { status: 401 })
       }
       return new Response(JSON.stringify(allowList, null, 2), { headers: { 'Content-Type': 'application/json' } })
     }
     if (url.pathname === '/admin/revoke' && req.method === 'POST') {
-      if (!ctEq(req.headers.get('authorization'), `Bearer ${TOKEN}`)) {
+      if (!adminAuthorized(req, ip)) {
         return new Response('unauthorized', { status: 401 })
       }
       return req.json().then((body: any) => {
@@ -596,7 +618,6 @@ const server = Bun.serve<WsData>({
       return new Response('TLS required', { status: 421 })
     }
 
-    const ip = resolveIp(req, server)
     if ((ipConnections.get(ip) ?? 0) >= MAX_IP_CONNS) {
       return new Response('too many connections', { status: 429 })
     }

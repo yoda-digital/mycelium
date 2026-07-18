@@ -1234,6 +1234,17 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'myc_verify',
+      description: 'Show pinned Ed25519 fingerprints for out-of-band verification — this peer\'s own identity (no argument), or a known peer\'s pinned key. Read-only; use it to close the first-contact TOFU window on a healthy peer.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          peer_name: { type: 'string', description: 'Peer to show (default: this peer\'s own identity)' },
+          room: { type: 'string', description: 'Limit to one room (default: all joined rooms)' },
+        },
+      },
+    },
+    {
       name: 'myc_rotate_key',
       description: 'Rotate this peer\'s Ed25519 identity key. Announces a signed continuity statement to all known peers (online + offline envelopes) and migrates the relay name binding — no TOFU violations for peers that receive the announcement.',
       inputSchema: {
@@ -1356,7 +1367,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       // Always show fingerprint first
       const fp = fingerprint(pk.sign_pubkey)
       if (!args.confirm) {
-        return { content: [{ type: 'text', text: `🔑 ${peerName}@${room} fingerprint:\n\n  ${fp}\n\nVerify this matches the peer's fingerprint (run myc_peers on that instance).\nThen call myc_trust with confirm=true.` }] }
+        return { content: [{ type: 'text', text: `🔑 ${peerName}@${room} fingerprint:\n\n  ${fp}\n\nVerify this matches the peer's fingerprint (run myc_verify on that instance).\nThen call myc_trust with confirm=true.` }] }
       }
       tofuOverride(room, peerName, pk.sign_pubkey)
       // Explicit human override also clears an STS-failure block (same recovery path).
@@ -1366,6 +1377,33 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       const session = processPeerKeys(room, peerName, pk.sign_pubkey, pk.eph_enc_pubkey, pk.eph_enc_pubkey_sig, pk.session_id)
       pendingTrustKeys.delete(key)
       return { content: [{ type: 'text', text: session ? `✅ ${peerName}@${room} trusted (${fp})` : `❌ Key verification failed` }] }
+    }
+
+    case 'myc_verify': {
+      const self = fingerprint(toB64(ltKeys.signPublicKey))
+      if (!args.peer_name) {
+        return { content: [{ type: 'text', text: `🔑 This peer (${PEER}) identity fingerprint:\n\n  ${self}\n\nShare it out of band; the other side confirms with  myc_verify ${PEER}` }] }
+      }
+      const scopeRooms = args.room ? [args.room] : ROOMS
+      const lines: string[] = []
+      for (const r of scopeRooms) {
+        const pin = tofuStore.rooms[r]?.[args.peer_name]
+        if (!pin) continue
+        const sess = peerSessions.get(rk(r, args.peer_name))
+        const status = sess
+          ? `${sess.tofuStatus === 'new' ? 'pinned (new this session)' : 'pinned & trusted'}${sess.stsVerified ? ', STS-verified 🤝' : ''}`
+          : 'pinned (peer currently offline)'
+        lines.push(`  ${args.peer_name}@${r}\n    ${fingerprint(pin.sign_pubkey)}\n    ${status}`)
+      }
+      if (!lines.length) {
+        const blocked = [...pendingTrustKeys.keys()].filter(k =>
+          k.split('\0')[1] === args.peer_name && (!args.room || k.split('\0')[0] === args.room))
+        if (blocked.length) {
+          return { content: [{ type: 'text', text: `⚠️ ${args.peer_name} is BLOCKED (unverified/changed key) — use myc_trust to review the fingerprint and override.` }] }
+        }
+        return { content: [{ type: 'text', text: `No pinned key for ${args.peer_name}${args.room ? ` in room ${args.room}` : ''}.` }] }
+      }
+      return { content: [{ type: 'text', text: `Pinned fingerprints — verify each out of band:\n\n${lines.join('\n')}\n\nThis peer (${PEER}): ${self}` }] }
     }
 
     case 'myc_rotate_key': {

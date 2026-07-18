@@ -21,6 +21,7 @@ const toB64 = (x: Uint8Array) => sodium.to_base64(x, sodium.base64_variants.ORIG
 const REPO = import.meta.dir
 const PORT = 9902
 const TOKEN = 'itest-' + Date.now()
+const ADMIN_TOKEN = 'iadmin-' + Date.now()
 const RELAY_URL = `ws://127.0.0.1:${PORT}`
 const SCRATCH = mkdtempSync(join(tmpdir(), 'myc-itest-'))
 
@@ -72,6 +73,7 @@ const relay = Bun.spawn(['bun', 'run', 'relay.ts'], {
   env: {
     ...process.env,
     RELAY_TOKEN: TOKEN,
+    RELAY_ADMIN_TOKEN: ADMIN_TOKEN,
     RELAY_PORT: String(PORT),
     RELAY_KEY_FILE: join(SCRATCH, 'relay-keys.json'),
     RELAY_ALLOW_FILE: join(SCRATCH, 'relay-allow.json'),
@@ -140,6 +142,18 @@ try {
   assert(/bob/.test(peersTxt) && !/BLOCKED/.test(peersTxt), 'peers list shows bob, not blocked')
   assert(/🤝/.test(peersTxt), 'peers list shows STS handshake (🤝)')
 
+  console.log('\n🔎 IT6b: myc_verify surfaces pinned fingerprints for out-of-band verification')
+  const FP = /[0-9a-f]{4}(?::[0-9a-f]{4}){3,}/i
+  const bobSelf = bob.toolText(await bob.callTool('myc_verify', {}))
+  const bobFp = bobSelf.match(FP)?.[0]
+  assert(!!bobFp, 'myc_verify (self) shows this peer\'s own fingerprint')
+  const aliceSelf = alice.toolText(await alice.callTool('myc_verify', {}))
+  assert(FP.test(aliceSelf), 'myc_verify (self) works on alice too')
+  const aliceViewBob = alice.toolText(await alice.callTool('myc_verify', { peer_name: 'bob' }))
+  assert(!!bobFp && aliceViewBob.includes(bobFp), "alice's pinned fingerprint for bob matches bob's own fingerprint (verifiable for a HEALTHY peer)")
+  const missing = alice.toolText(await alice.callTool('myc_verify', { peer_name: 'nobody' }))
+  assert(/No pinned key/.test(missing), 'myc_verify reports no pin for an unknown peer')
+
   console.log('\n🧹 IT7: no duplicate deliveries observed across the burst')
   const uniqueContents = new Set(bob.from('alice').map(m => m.content))
   assert(uniqueContents.size === bob.from('alice').length, 'no duplicate deliveries observed')
@@ -183,7 +197,7 @@ try {
   // and blocklists the lost key. This is the real "peer lost its keys" flow.
   const revokeRes = await fetch(`http://127.0.0.1:${PORT}/admin/revoke`, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
+    headers: { Authorization: `Bearer ${ADMIN_TOKEN}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ room: 'default', name: 'bob' }),
   })
   const revokeJson: any = await revokeRes.json()
@@ -240,7 +254,7 @@ try {
   assert((bigMsg?.meta?.chunked ?? 0) >= 5, `delivery metadata reports the chunk count (${bigMsg?.meta?.chunked})`)
 
   console.log('\n🔑 IT15: key rotation — continuity-signed, no TOFU violation, relay binding migrates')
-  const allowBefore: any = await (await fetch(`http://127.0.0.1:${PORT}/admin/allowlist`, { headers: { Authorization: `Bearer ${TOKEN}` } })).json()
+  const allowBefore: any = await (await fetch(`http://127.0.0.1:${PORT}/admin/allowlist`, { headers: { Authorization: `Bearer ${ADMIN_TOKEN}` } })).json()
   const aliceKeyBefore = allowBefore.bindings?.default?.alice
   assert(typeof aliceKeyBefore === 'string', 'admin allowlist endpoint exposes the current binding')
   bob3.clear()
@@ -249,7 +263,7 @@ try {
   assert(await waitUntil(() => bob3.channelMsgs.some(m => m.meta?.type === 'key_rotated' && m.meta?.peer === 'alice'), 6000), 'peer verified the continuity signature and updated its pin')
   assert(await waitUntil(() => alice.stderr.filter(l => /Auth OK/.test(l)).length >= 2, 8000), 'alice re-authenticated under the NEW key (binding migrated, no token needed)')
   assert(!bob3.stderrHas(/TOFU VIOLATION: alice/), 'NO TOFU violation at the peer — rotation is seamless')
-  const allowAfter: any = await (await fetch(`http://127.0.0.1:${PORT}/admin/allowlist`, { headers: { Authorization: `Bearer ${TOKEN}` } })).json()
+  const allowAfter: any = await (await fetch(`http://127.0.0.1:${PORT}/admin/allowlist`, { headers: { Authorization: `Bearer ${ADMIN_TOKEN}` } })).json()
   assert(allowAfter.bindings?.default?.alice && allowAfter.bindings.default.alice !== aliceKeyBefore, 'relay name binding migrated to the new key')
   bob3.clear()
   await waitUntil(() => alice.stderrHas(/STS verified: bob/), 6000)
