@@ -1,22 +1,19 @@
-# Mycelium — Install Guide
+# Mycelium — install guide
 
-Complete setup from zero to encrypted peer-to-peer messaging between Claude Code instances.
+Zero to encrypted messaging between Claude Code instances. Read top to bottom the first time; after that it works as a reference. If you only skim one thing, make it section 5 — the security defaults are deliberately loose for first contact, and tightening them takes two minutes.
 
 ## Prerequisites
 
-**Bun >= 1.3.5** — the only runtime dependency.
+**Bun >= 1.3.5.** That is the only runtime dependency.
 
 ```bash
-# Install Bun (if not present)
 curl -fsSL https://bun.sh/install | bash
-
-# Verify
 bun --version   # must be >= 1.3.5
 ```
 
-**Ports:** The relay listens on `9900/tcp` by default. Open this port if behind a firewall.
+**Ports:** the relay listens on `9900/tcp` by default. Open it if you are behind a firewall.
 
-**TLS:** The relay speaks plain WebSocket. Put it behind a TLS-terminating reverse proxy (nginx, Caddy, Cloudflare Tunnel) for production. The relay does not handle TLS certificates itself.
+**TLS:** the relay speaks plain WebSocket and does not handle certificates itself. Put it behind nginx, Caddy, or a Cloudflare Tunnel for anything that leaves localhost. Configs below.
 
 ---
 
@@ -28,7 +25,7 @@ cd mycelium
 bun install
 ```
 
-This pulls three dependencies: `libsodium-wrappers-sumo` (crypto), `@modelcontextprotocol/sdk` (MCP), `zod` (validation).
+Three dependencies: `libsodium-wrappers-sumo` (crypto), `@modelcontextprotocol/sdk` (MCP), `zod` (validation). That's the whole tree.
 
 ---
 
@@ -38,10 +35,10 @@ This pulls three dependencies: `libsodium-wrappers-sumo` (crypto), `@modelcontex
 
 ```bash
 export RELAY_TOKEN=$(openssl rand -hex 32)
-echo "RELAY_TOKEN=$RELAY_TOKEN"    # save this — peers need it to register
+echo "RELAY_TOKEN=$RELAY_TOKEN"
 ```
 
-This token is a **one-time invite**. After a peer's first connection, the relay stores its Ed25519 public key in an allow-list. Subsequent connections authenticate via cryptographic challenge-response — the token is no longer needed for that peer.
+Save it. The token is a one-time invite: a peer presents it on first connection, the relay pins that peer's Ed25519 key to its name, and from then on the peer authenticates with its key via challenge-response. The token never authenticates a known peer again.
 
 ### Start
 
@@ -49,14 +46,13 @@ This token is a **one-time invite**. After a peer's first connection, the relay 
 RELAY_TOKEN=$RELAY_TOKEN bun run relay.ts
 ```
 
-The relay will log its **Ed25519 fingerprint** on startup:
+The relay logs its own Ed25519 fingerprint on startup:
 
 ```
 {"ts":"...","level":"info","msg":"relay_identity","fingerprint":"a1b2:c3d4:e5f6:7890:abcd:ef12:3456:7890"}
-{"ts":"...","level":"info","msg":"relay_started","port":9900,...}
 ```
 
-**Save this fingerprint.** Peers use it to verify they're connecting to the real relay, not a MITM. This is the `MYC_RELAY_FINGERPRINT` value.
+**Write this fingerprint down.** Peers pin it (`MYC_RELAY_FINGERPRINT`) to refuse impostor relays before any credential leaves the machine. You will want it in section 5, and future-you will not enjoy fishing it out of old logs.
 
 ### Persist with systemd (Linux)
 
@@ -90,7 +86,6 @@ sudo systemctl enable --now mycelium-relay
 ### TLS with nginx
 
 ```nginx
-# /etc/nginx/sites-available/mycelium
 upstream mycelium {
     server 127.0.0.1:9900;
 }
@@ -114,7 +109,7 @@ server {
 }
 ```
 
-Set `RELAY_REQUIRE_TLS=true` and `RELAY_TRUSTED_PROXY=true` on the relay when behind nginx.
+Set `RELAY_REQUIRE_TLS=true` and `RELAY_TRUSTED_PROXY=true` on the relay when it sits behind nginx.
 
 ### TLS with Caddy (simpler)
 
@@ -124,21 +119,20 @@ relay.example.com {
 }
 ```
 
-Caddy handles TLS automatically. Set `RELAY_TRUSTED_PROXY=true`.
+Caddy handles certificates on its own. Set `RELAY_TRUSTED_PROXY=true`.
 
 ---
 
 ## 3. Configure peers (Claude Code instances)
 
-Each Claude Code instance that participates needs the MCP server configured.
+Every participating Claude Code instance runs the MCP server.
 
 ### Locate your MCP config
 
 ```bash
-# Claude Code reads MCP config from:
 ~/.claude.json          # user (global) scope
-.mcp.json               # project scope, in the repo root
-# Easiest is the CLI, which writes the JSON below for you:
+.mcp.json               # project scope, repo root
+# Or let the CLI write it for you:
 #   claude mcp add-json mycelium '{"command":"bun","args":["/abs/path/peer-channel.ts"],"env":{...}}'
 ```
 
@@ -160,138 +154,124 @@ Each Claude Code instance that participates needs the MCP server configured.
 }
 ```
 
-**Required fields:**
-
 | Field | Value |
 |---|---|
-| `MYC_RELAY` | WebSocket URL of the relay. Use `wss://` for TLS, `ws://` for local dev. |
-| `MYC_TOKEN` | The `RELAY_TOKEN` from the relay. Only needed for first connection. |
-| `MYC_PEER` | A unique name for this instance. Names are bound to identity keys — once a name authenticates with a key, no other key can claim that name. |
+| `MYC_RELAY` | Relay URL. `wss://` for TLS, `ws://` for local dev. Comma-separate several for failover. |
+| `MYC_TOKEN` | The `RELAY_TOKEN`. Only matters on first connection. |
+| `MYC_PEER` | A unique name. Names bind permanently to identity keys on first use — pick one you can live with. |
 
-**Each peer must have a different `MYC_PEER` name.** Names are permanent — changing a name creates a new identity.
-
-### Load the MCP server
+### Load it
 
 ```bash
 claude --dangerously-load-development-channels server:mycelium
 ```
 
-Or restart Claude Code if using the desktop config file.
+Or restart Claude Code if you edited the desktop config file.
 
 ### Verify it works
 
-Once loaded, ask Claude Code:
+Ask Claude Code:
 
 ```
 Use myc_peers to show connected peers.
 ```
 
-You should see other connected peers with their TOFU status:
-- `bob` (locked) = trusted (seen before, same key)
-- `charlie` (new) = first contact (key pinned, future connections verified)
-- `dave` (handshake) = STS mutual auth completed (strongest verification)
+You should see the other peers with their trust status:
 
-Known-but-offline peers are listed as reachable via identity envelope — `myc_send` to them queues an offline message the relay stores until they return.
+- `bob` (locked) = seen before, same key
+- `charlie` (new) = first contact, key now pinned
+- `dave` (handshake) = STS mutual confirmation completed, the strongest state
 
-If your MCP host does not surface channel notifications, incoming messages are still buffered — drain them with:
+Peers the instance knows but who are currently away show up as reachable via identity envelope — `myc_send` to them queues an offline message the relay holds until they return.
+
+If your MCP host does not surface channel notifications, incoming messages are still there — they buffer in an inbox:
 
 ```
 Use myc_recv to read pending messages.
 ```
 
+Nothing depends on the notification channel. `myc_recv` works everywhere.
+
 ---
 
-## 4. Multi-peer example
+## 4. Multi-peer and multi-room
 
-Three Claude Code instances talking to each other:
+Three instances, one room:
 
-**Instance 1 — alice:**
 ```json
-"env": {
-  "MYC_RELAY": "wss://relay.example.com",
-  "MYC_TOKEN": "abc123...",
-  "MYC_PEER": "alice"
-}
+"env": { "MYC_RELAY": "wss://relay.example.com", "MYC_TOKEN": "abc123...", "MYC_PEER": "alice" }
+```
+```json
+"env": { "MYC_RELAY": "wss://relay.example.com", "MYC_TOKEN": "abc123...", "MYC_PEER": "bob" }
+```
+```json
+"env": { "MYC_RELAY": "wss://relay.example.com", "MYC_TOKEN": "abc123...", "MYC_PEER": "charlie" }
 ```
 
-**Instance 2 — bob:**
+Same token, same relay, different names. Each generates its own identity on first run.
+
+### Rooms
+
+A peer can join up to eight rooms over one connection:
+
 ```json
-"env": {
-  "MYC_RELAY": "wss://relay.example.com",
-  "MYC_TOKEN": "abc123...",
-  "MYC_PEER": "bob"
-}
+"MYC_ROOM": "default,ops"
 ```
 
-**Instance 3 — charlie:**
-```json
-"env": {
-  "MYC_RELAY": "wss://relay.example.com",
-  "MYC_TOKEN": "abc123...",
-  "MYC_PEER": "charlie"
-}
-```
+Rooms are isolated: peers only see others in shared rooms, every message is cryptographically bound to its room (the relay cannot re-route across rooms even if it wants to), and trust pins are scoped per room. `myc_send` picks the right room automatically when the target is unambiguous; pass `room` explicitly when it is not. `myc_rooms` lists what exists on the relay — non-member rooms show peer counts only, and `RELAY_DISCOVERY=false` turns even that off.
 
-Same token, same relay, different names. Each generates its own Ed25519 identity on first run.
+### Multiple peers on one machine
 
-### Multiple peers on the same machine
-
-Each peer needs its **own identity keypair**. By default all peers use `~/.mycelium-keys.json` — if two peers on the same machine share that file, the second peer connects with the first peer's key under a different name, causing TOFU violations on every other peer that sees both.
-
-Give each peer a separate `MYC_KEY_FILE`:
+Each peer needs its **own identity keypair**. The default key file is shared, and two peers sharing it means the second one connects with the first one's key under a different name — every other peer then sees a TOFU violation. Give each a separate file:
 
 ```json
 "env": {
-  "MYC_RELAY": "wss://relay.example.com",
-  "MYC_TOKEN": "abc123...",
   "MYC_PEER": "alice",
   "MYC_KEY_FILE": "~/.mycelium-keys-alice.json"
 }
 ```
 
-```json
-"env": {
-  "MYC_RELAY": "wss://relay.example.com",
-  "MYC_TOKEN": "abc123...",
-  "MYC_PEER": "bob",
-  "MYC_KEY_FILE": "~/.mycelium-keys-bob.json"
-}
-```
-
-Each file is created automatically on first run. The same applies to `MYC_TOFU_FILE` and `MYC_REPLAY_FILE` if you want fully isolated state per peer.
+Files are created on first run. The same applies to `MYC_TOFU_FILE` and `MYC_REPLAY_FILE` if you want fully isolated state per peer.
 
 ---
 
 ## 5. Security hardening
 
+The defaults get you running. These four steps get you to the posture the protocol was actually designed for.
+
 ### Pin the relay fingerprint
 
-Prevents MITM between peer and relay. Get the fingerprint from the relay startup log, then add to each peer:
+Take the fingerprint from the relay's startup log and add it to every peer:
 
 ```json
-"env": {
-  "MYC_RELAY": "wss://relay.example.com",
-  "MYC_TOKEN": "abc123...",
-  "MYC_PEER": "alice",
-  "MYC_RELAY_FINGERPRINT": "a1b2:c3d4:e5f6:7890:abcd:ef12:3456:7890"
-}
+"MYC_RELAY_FINGERPRINT": "a1b2:c3d4:e5f6:7890:abcd:ef12:3456:7890"
 ```
 
-The peer will **refuse to send credentials** if the relay's fingerprint doesn't match. This also seals the auth token (encrypted to the relay's public key) so even TLS-intercepting proxies can't steal it.
+The peer now refuses to send credentials to anything that cannot prove it holds the relay's key, and it seals the auth token to that key, so even a TLS-intercepting middlebox never sees it in plaintext. Running several relays for failover? Pin them all — the variable takes a comma-separated list, one fingerprint per relay. You do not have to choose between failover and pinning.
 
 ### Enforce challenge-response only
 
-After all peers have registered (first connection), disable token-only auth:
+Once every peer has registered:
 
 ```bash
 RELAY_REQUIRE_CHALLENGE=true
 ```
 
-Now the relay rejects any peer that doesn't sign the cryptographic challenge. The token becomes useless for authentication — only the allow-list matters.
+Token-only auth is now rejected. The token stops mattering entirely; only pinned keys authenticate.
+
+### Encrypt key files at rest
+
+```json
+"env": { "MYC_KEY_PASSPHRASE": "correct horse battery staple" }
+```
+
+The identity key file is encrypted with Argon2id + XSalsa20-Poly1305. An existing plaintext file upgrades in place on next start; a wrong passphrase is a refusal to start, not a warning. Same for the relay via `RELAY_KEY_PASSPHRASE`.
+
+Be honest with yourself about what this buys: the passphrase lives in the MCP config on the same disk. It protects key material in backups and file-level exfiltration, not against someone who already reads your config.
 
 ### Isolate TOFU per project
 
-By default, all projects share the same TOFU store (`~/.mycelium-known-peers.json`). For isolation:
+All projects share `~/.mycelium-known-peers.json` by default. If different projects should not share trust decisions:
 
 ```json
 "env": {
@@ -300,67 +280,37 @@ By default, all projects share the same TOFU store (`~/.mycelium-known-peers.jso
 }
 ```
 
+---
+
+## 6. Operating: revocation and key rotation
+
 ### Revoke a peer
 
-Use the admin API (bearer auth = the relay token). It removes the name binding, **blocklists the key** (so it cannot re-register itself with the invite token), and disconnects the peer if it is currently online:
+The admin API (bearer auth = the relay token) removes the name binding, blocklists the key so it cannot re-invite itself with the token, and kicks the live connection:
 
 ```bash
 curl -X POST -H "Authorization: Bearer $RELAY_TOKEN" -H 'Content-Type: application/json' \
   -d '{"room":"default","name":"mallory"}' http://relay:9900/admin/revoke
 
-# Inspect current bindings
+# See current bindings
 curl -H "Authorization: Bearer $RELAY_TOKEN" http://relay:9900/admin/allowlist
 
-# Undo a revocation (the key re-registers with the token on next connect)
+# Changed your mind
 curl -X POST -H "Authorization: Bearer $RELAY_TOKEN" -H 'Content-Type: application/json' \
   -d '{"room":"default","pubkey":"<base64-key>","undo":true}' http://relay:9900/admin/revoke
 ```
 
-No token rotation needed for the common case. Caveat: someone who still *holds* the invite token can mint a fresh identity under a new name — rotate `RELAY_TOKEN` to fully evict an actor.
+One caveat worth knowing before you need it: revocation blocks the *key*. Someone still holding the invite token can mint a fresh identity under a new name. Rotate `RELAY_TOKEN` when you need a person out, not just a key.
 
-### Rotate a peer's identity key
+### Rotate a peer's identity
 
-From the peer itself: call the `myc_rotate_key` tool with `confirm=true`. It signs a continuity statement with the old key, announces it to every known peer (live sessions now, offline envelopes for absent peers), and re-authenticates — the relay migrates the name binding automatically. No TOFU violations, no manual re-trust.
+From the peer: `myc_rotate_key` with `confirm=true`. It signs a continuity statement with the old key, announces it to every known peer — live sessions immediately, offline envelopes for whoever is away — and reconnects under the new key. The relay migrates the name binding from the same statement. Nobody sees a TOFU violation; nothing needs re-trusting.
 
-If a peer **lost** its keys (no continuity possible): revoke its old binding via `/admin/revoke`, restart the peer (it generates a fresh identity and registers with the token), and have other peers verify the new fingerprint via `myc_trust`.
-
-### Encrypt key files at rest
-
-```json
-"env": { "MYC_KEY_PASSPHRASE": "correct horse battery staple" }
-```
-
-The identity key file is encrypted with Argon2id + XSalsa20-Poly1305; an existing plaintext file is upgraded in place on the next start, and a wrong passphrase is a fail-closed startup error. Same for the relay via `RELAY_KEY_PASSPHRASE`. (The passphrase necessarily lives in the MCP config on the same disk — this protects key material in backups and file-level exfiltration, not against an attacker who already reads your config.)
+If a peer **lost** its keys, continuity is impossible by design. Recovery: revoke the old binding via `/admin/revoke`, restart the peer (it generates a fresh identity and registers with the token), and have the other peers verify the new fingerprint with `myc_trust`. Deliberate friction — a lost key and an impersonation attempt look identical from the outside.
 
 ---
 
-## 6. Multi-relay failover
-
-For high availability, run multiple independent relays and give peers a comma-separated list:
-
-```json
-"env": {
-  "MYC_RELAY": "wss://relay1.example.com,wss://relay2.example.com,wss://relay3.example.com"
-}
-```
-
-**How it works:**
-- Peer connects to the first relay in the list
-- On disconnect, tries the next relay
-- After exhausting the list, wraps around with exponential backoff
-- All peers should use the **same ordered list** so they converge on the same relay
-
-Each relay is independent — no inter-relay coordination. The peer re-authenticates and regenerates ephemeral keys on each reconnect (PFS is maintained).
-
-**Fingerprints:** each relay has its own identity. Pin them ALL — `MYC_RELAY_FINGERPRINT` accepts a comma-separated list matched as a set, so failover keeps identity pinning:
-
-```json
-"MYC_RELAY_FINGERPRINT": "a1b2:c3d4:...relay1..., 9f8e:7d6c:...relay2..."
-```
-
----
-
-## 7. Verify installation
+## 7. Verify the installation
 
 ### Run the test suite
 
@@ -368,63 +318,57 @@ Each relay is independent — no inter-relay coordination. The peer re-authentic
 bun run test
 ```
 
-Expected: `0 failed` across all three suites (89 unit + 63 integration + 24 controlled-relay = 176 tests). Tests spawn their own relay and peer processes — no external dependencies.
+Expect `0 failed` across all three suites — 89 unit, 63 integration (real relay, real peer processes), 24 controlled-malicious-relay — 176 total. The tests spawn everything they need; no external dependencies.
 
-### Health check (relay)
+### Health check
 
 ```bash
 curl -s -H "Authorization: Bearer $RELAY_TOKEN" http://localhost:9900/health | jq .
 ```
 
-Returns:
 ```json
 {
   "uptime_s": 3600,
   "total_connections": 3,
   "memory": { "rss_mb": 45, "heap_mb": 12 },
-  "metrics": {
-    "msg_relayed": 1024,
-    "msg_rate_limited": 0,
-    "msg_queued": 5,
-    "msg_drained": 5
-  },
+  "metrics": { "msg_relayed": 1024, "msg_rate_limited": 0, "msg_queued": 5, "msg_drained": 5 },
   "rooms": { "default": ["alice", "bob", "charlie"] },
-  "offline_queues": 0
+  "offline_queues": 0,
+  "proto": 2
 }
 ```
 
-### Manual WebSocket test
+### Manual WebSocket poke
 
 ```bash
-# Verify relay sends challenge on connect
 bun -e "
 const ws = new WebSocket('ws://localhost:9900')
 ws.onmessage = e => { console.log(JSON.parse(e.data)); ws.close() }
 "
 ```
 
-Expected: `{ type: "challenge", nonce: "...", relay_pubkey: "...", relay_sig: "...", timestamp: "..." }`
+Expect a `challenge` message carrying `nonce`, `relay_pubkey`, `relay_sig`, `timestamp`, and `proto: 2`.
 
 ---
 
-## 8. Peer identity files
+## 8. Files on disk
 
-On first run, each peer generates:
+Each peer generates:
 
 | File | What | Sensitivity |
 |---|---|---|
-| `~/.mycelium-keys.json` | Ed25519 identity keypair | **SECRET** — treat like an SSH private key |
-| `~/.mycelium-known-peers.json` | TOFU pinned peer public keys | Integrity-critical — tampering = MITM |
-| `~/.mycelium-replay-state.json` | Replay protection state (msg IDs + seqs) | Operational — safe to delete (resets dedup) |
+| `~/.mycelium-keys.json` | Ed25519 identity keypair | **Secret.** Treat like an SSH private key. Encryptable at rest via `MYC_KEY_PASSPHRASE`. |
+| `~/.mycelium-known-peers.json` | TOFU-pinned peer keys, per room | Integrity-critical — tampering here is a MITM. |
+| `~/.mycelium-replay-state.json` | Replay protection state | Operational. Safe to delete; resets dedup. |
 
 The relay generates:
 
 | File | What | Sensitivity |
 |---|---|---|
-| `~/.mycelium-relay-keys.json` | Relay Ed25519 identity keypair | **SECRET** — regenerating changes the fingerprint |
-| `~/.mycelium-relay-allow.json` | Per-room peer allow-list | Integrity-critical — controls who can connect |
+| `~/.mycelium-relay-keys.json` | Relay Ed25519 identity | **Secret.** Regenerating changes the fingerprint every peer has pinned. |
+| `~/.mycelium-relay-allow.json` | Name↔key bindings + revocation blocklist | Integrity-critical — this file decides who connects. |
 
-**Backup `~/.mycelium-keys.json` and `~/.mycelium-relay-keys.json`.** Losing them means generating new identities, which triggers TOFU violations on all peers that knew the old keys.
+Back up the two key files. Losing the peer key means a new identity (TOFU violations everywhere, recovery via section 6). Losing the relay key means every peer re-pins a new fingerprint.
 
 ---
 
@@ -434,40 +378,40 @@ The relay generates:
 
 | Variable | Default | Description |
 |---|---|---|
-| `RELAY_TOKEN` | *required* | Room invite token. New peers present this on first auth. |
+| `RELAY_TOKEN` | *required* | Room invite token, presented once by new peers. |
 | `RELAY_PORT` | `9900` | WebSocket listen port. |
 | `RELAY_MAX_PEERS` | `50` | Max peers per room. |
-| `RELAY_MAX_MSG_BYTES` | `65536` | Max WebSocket message size in bytes. |
+| `RELAY_MAX_MSG_BYTES` | `65536` | Max frame size. Peers chunk larger messages automatically. |
 | `RELAY_RATE_LIMIT` | `300` | Messages per minute per peer (token bucket). |
 | `RELAY_QUEUE_MAX_MSGS` | `50` | Offline queue depth per peer. |
 | `RELAY_QUEUE_MAX_BYTES` | `524288` | Offline queue max total bytes. |
-| `RELAY_QUEUE_TTL_S` | `300` | Offline queued message TTL (seconds). |
+| `RELAY_QUEUE_TTL_S` | `300` | Offline message TTL. Keep at or below the peers' `MYC_OFFLINE_MAX_AGE_S`, or queued messages expire cryptographically before they expire physically. |
 | `RELAY_REQUIRE_TLS` | `false` | Reject connections without `X-Forwarded-Proto: https`. |
-| `RELAY_TRUSTED_PROXY` | `false` | Trust `X-Forwarded-For` for IP tracking. |
+| `RELAY_TRUSTED_PROXY` | `false` | Trust `X-Forwarded-For` for per-IP limits. |
 | `RELAY_MAX_IP_CONNS` | `10` | Max simultaneous connections per IP. |
 | `RELAY_PING_INTERVAL` | `30` | WebSocket ping interval (seconds). |
-| `RELAY_AUTH_TIMEOUT_MS` | `5000` | Close connection if no auth within this time. |
-| `RELAY_KEY_FILE` | `~/.mycelium-relay-keys.json` | Relay Ed25519 keypair file. |
-| `RELAY_KEY_PASSPHRASE` | *(none)* | Encrypt the relay key file at rest (Argon2id). |
-| `RELAY_ALLOW_FILE` | `~/.mycelium-relay-allow.json` | Name↔key bindings + revocation blocklist (v2, auto-migrated from v1). |
-| `RELAY_REQUIRE_CHALLENGE` | `false` | Reject peers that don't sign the challenge. |
-| `RELAY_DISCOVERY` | `true` | Answer `list_rooms` for non-member rooms (peer counts only; member rooms always list names). |
+| `RELAY_AUTH_TIMEOUT_MS` | `5000` | Close unauthenticated connections after this. |
+| `RELAY_KEY_FILE` | `~/.mycelium-relay-keys.json` | Relay identity keypair. |
+| `RELAY_KEY_PASSPHRASE` | *(none)* | Encrypt the relay key file at rest. |
+| `RELAY_ALLOW_FILE` | `~/.mycelium-relay-allow.json` | Bindings + blocklist (v2 format; v1 files migrate automatically). |
+| `RELAY_REQUIRE_CHALLENGE` | `false` | Reject token-only auth. Turn on after everyone registers. |
+| `RELAY_DISCOVERY` | `true` | Answer `list_rooms` for non-member rooms (counts only). |
 
 ### Peer (`peer-channel.ts`)
 
 | Variable | Default | Description |
 |---|---|---|
-| `MYC_RELAY` | *required* | Relay URL(s). Comma-separated for failover: `wss://r1,wss://r2`. |
-| `MYC_TOKEN` | *required* | Invite token. Only needed for first connection to a relay. |
-| `MYC_PEER` | *required* | Unique peer name. Bound to Ed25519 key on first use. |
-| `MYC_ROOM` | `default` | Room(s) to join — comma-separated, up to 8. Peers only see others in shared rooms; messages are cryptographically bound to their room. |
-| `MYC_KEY_FILE` | `~/.mycelium-keys.json` | Ed25519 identity keypair. |
-| `MYC_KEY_PASSPHRASE` | *(none)* | Encrypt the key file at rest (Argon2id; wrong passphrase = fail-closed). |
-| `MYC_TOFU_FILE` | `~/.mycelium-known-peers.json` | Known peer public keys (TOFU store, room-scoped, auto-migrated). |
+| `MYC_RELAY` | *required* | Relay URL(s), comma-separated for failover. |
+| `MYC_TOKEN` | *required* | Invite token; unused after first registration. |
+| `MYC_PEER` | *required* | Unique peer name, permanently bound to the key on first use. |
+| `MYC_ROOM` | `default` | Room(s), comma-separated, up to 8. |
+| `MYC_KEY_FILE` | `~/.mycelium-keys.json` | Identity keypair. |
+| `MYC_KEY_PASSPHRASE` | *(none)* | Encrypt the key file at rest; wrong passphrase refuses to start. |
+| `MYC_TOFU_FILE` | `~/.mycelium-known-peers.json` | Pinned peer keys, room-scoped (v1 files migrate). |
 | `MYC_REPLAY_FILE` | `~/.mycelium-replay-state.json` | Replay protection state. |
-| `MYC_RELAY_FINGERPRINT` | *(none)* | Pin relay identity(ies). Comma-separated list of `a1b2:c3d4:...` fingerprints (8 groups each) — one per relay in `MYC_RELAY`. Peer refuses to send credentials to an unpinned relay. |
-| `MYC_OFFLINE_MAX_AGE_S` | `3600` | Freshness window for offline envelopes. Keep the relay's `RELAY_QUEUE_TTL_S` at or below this. |
-| `MYC_MAX_MSG_BYTES` | `1048576` | Max logical message size; larger texts are rejected, everything above ~24KB is chunked transparently. |
+| `MYC_RELAY_FINGERPRINT` | *(none)* | Relay fingerprint(s), comma-separated, one per relay in `MYC_RELAY`. |
+| `MYC_OFFLINE_MAX_AGE_S` | `3600` | Freshness window for offline envelopes. |
+| `MYC_MAX_MSG_BYTES` | `1048576` | Max logical message size; larger sends are rejected with an explicit error. |
 
 ---
 
@@ -477,59 +421,49 @@ The relay generates:
 
 ```
 [myc/alice] WS fail: ...
-[myc/alice] Reconnect 1.2s → relay 1/1 (attempt 1)
+[myc/alice] Reconnect 1.2s (attempt 1)
 ```
 
-- Check relay is running: `curl http://relay:9900/health -H "Authorization: Bearer $TOKEN"`
-- Check the URL scheme: `ws://` for plain, `wss://` for TLS
-- Check firewall: port 9900 must be reachable
-- If behind nginx: ensure WebSocket upgrade headers are forwarded
+Work through it in order: is the relay up (`curl .../health` with the bearer token)? Right scheme (`ws://` vs `wss://`)? Port reachable? If nginx is in the path, are the WebSocket upgrade headers forwarded?
 
 ### TOFU violation (peer blocked)
 
 ```
-[myc/alice] TOFU VIOLATION: bob key changed! BLOCKED.
+[myc/alice] TOFU VIOLATION: bob@default key changed! BLOCKED.
 ```
 
-This means `bob` connected with a **different** Ed25519 key than what was pinned. Causes:
-1. `bob` regenerated keys (deleted `~/.mycelium-keys.json`)
-2. Someone else is impersonating `bob`
+`bob` presented a different key than the one pinned. Either bob legitimately lost their keys, or someone is impersonating bob. You cannot tell the difference from here, which is exactly why the block is fail-closed.
 
-**To resolve (if legitimate key change):**
-1. Have `alice` run `myc_trust(peer_name="bob")` to see the new fingerprint
-2. Verify the fingerprint out-of-band (ask `bob` to run `myc_peers`)
-3. If fingerprints match: `myc_trust(peer_name="bob", confirm=true)`
+If it is legitimate: `myc_trust(peer_name="bob")` shows the new fingerprint, verify it out of band (ask bob to run `myc_peers` on their side), then `myc_trust(peer_name="bob", confirm=true)`. If bob rotated properly with `myc_rotate_key`, you will never see this at all — the pin updates itself.
 
 ### Relay identity mismatch
 
 ```
-[myc/alice] RELAY IDENTITY MISMATCH: expected a1b2:..., got 9c2e:...
+[myc/alice] RELAY IDENTITY MISMATCH: got 9c2e:..., not in pinned set
 ```
 
-The relay's Ed25519 key doesn't match `MYC_RELAY_FINGERPRINT`. Causes:
-1. Relay regenerated keys (deleted `~/.mycelium-relay-keys.json`)
-2. You're connecting to the wrong relay
-3. A MITM is intercepting the connection
+The relay's key does not match any pinned fingerprint. Either the relay legitimately regenerated its keys, you are pointing at the wrong relay, or something is intercepting the connection. Verify against the relay's startup log before updating the pin; updating a pin to silence an error defeats its purpose.
 
-**Fix:** Verify the relay fingerprint from its startup log. Update `MYC_RELAY_FINGERPRINT` if the relay legitimately changed keys.
-
-### Messages not delivered
+### Delivery warnings
 
 ```
-[myc/alice] Message msg-123 to bob: delivery NOT confirmed (30s)
+⚠️ Message bob-... to bob FAILED after 5 attempt(s): ...
 ```
 
-The relay didn't deliver within 30 seconds. Causes:
-1. `bob` disconnected between send and delivery
-2. Relay is overloaded or has network issues
-3. Rate limiting (`RELAY_RATE_LIMIT`)
-
-Check relay health endpoint for `msg_rate_limited` count.
+You only see this after the machinery gave up: the peer stayed away past the offline window, or the relay kept refusing. Transient losses (a dropped frame, a stale session, a rate limit) retransmit on their own and never reach the model. Check the relay's `/health` metrics if failures repeat — `msg_rate_limited` climbing usually means an agent is chattier than your `RELAY_RATE_LIMIT`.
 
 ### Identity mismatch (name taken)
 
 ```
-auth: peer "alice" bound to different identity
+auth: peer "alice" bound to different identity in room "default"
 ```
 
-Another key already registered the name `alice` on this relay. Names are permanently bound to keys. Use a different `MYC_PEER` name, or remove the old key from the relay's allow-list.
+The name `alice` is bound to another key — bindings are permanent and survive disconnects, so this fires even when the original alice is offline. That is the anti-squatting protection working. Pick a different name, or if you own the binding and lost the key, revoke it (section 6) and re-register.
+
+### Revoked
+
+```
+auth: key revoked in room "default"
+```
+
+The relay operator blocklisted this key. Undo it via `/admin/revoke` with `"undo": true`, or generate a fresh identity and re-register with the token.
