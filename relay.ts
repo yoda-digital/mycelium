@@ -19,7 +19,7 @@
  */
 
 import sodium from 'libsodium-wrappers-sumo'
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs'
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs'
 import { dirname, resolve } from 'path'
 import { homedir } from 'os'
 import { PROTO } from './canonical.ts'
@@ -55,6 +55,9 @@ const REQUIRE_TLS = process.env.RELAY_REQUIRE_TLS === 'true'
 const TRUSTED_PROXY = process.env.RELAY_TRUSTED_PROXY === 'true'
 const RELAY_KEY_FILE = process.env.RELAY_KEY_FILE ?? resolve(homedir(), '.mycelium-relay-keys.json')
 const RELAY_ALLOW_FILE = process.env.RELAY_ALLOW_FILE ?? resolve(homedir(), '.mycelium-relay-allow.json')
+// Opt-in: persist the offline queue (CIPHERTEXT only) so a relay restart does not
+// drop mail whose sender may itself be gone (ephemeral agents). Unset = in-memory.
+const RELAY_QUEUE_FILE = process.env.RELAY_QUEUE_FILE
 const REQUIRE_CHALLENGE = process.env.RELAY_REQUIRE_CHALLENGE === 'true'
 const DISCOVERY = process.env.RELAY_DISCOVERY !== 'false'
 const KEY_PASSPHRASE = process.env.RELAY_KEY_PASSPHRASE
@@ -217,6 +220,37 @@ function makeMsgId(): string {
 // Fair-share uses active peers count, minimum 3
 // Returns true if the message was actually queued, false if a cap discarded it — so the
 // caller can tell the sender the truth instead of an unconditional "queued".
+// Persist/restore the offline queue (opt-in via RELAY_QUEUE_FILE). Only ciphertext
+// envelopes the relay already cannot read are stored — persisting leaks nothing new.
+// Atomic (tmp + rename) so a crash mid-write cannot corrupt the file.
+function saveQueues(): void {
+  if (!RELAY_QUEUE_FILE) return
+  try {
+    const obj: Record<string, QueuedMsg[]> = {}
+    for (const [k, q] of offlineQueues) if (q.length) obj[k] = q
+    const tmp = `${RELAY_QUEUE_FILE}.tmp`
+    mkdirSync(dirname(RELAY_QUEUE_FILE), { recursive: true })
+    writeFileSync(tmp, JSON.stringify({ version: 1, queues: obj }), { mode: 0o600 })
+    renameSync(tmp, RELAY_QUEUE_FILE)
+  } catch (e) { log('warn', 'queue_persist_failed', { error: String(e) }) }
+}
+
+function loadQueues(): void {
+  if (!RELAY_QUEUE_FILE || !existsSync(RELAY_QUEUE_FILE)) return
+  try {
+    const s = JSON.parse(readFileSync(RELAY_QUEUE_FILE, 'utf8'))
+    const now = Date.now()
+    let restored = 0, dropped = 0
+    for (const [k, q] of Object.entries((s?.queues ?? {}) as Record<string, QueuedMsg[]>)) {
+      const fresh = (q as QueuedMsg[]).filter(m =>
+        m && typeof m.data === 'string' && typeof m.expiresAt === 'number' && m.expiresAt > now)
+      dropped += (q as QueuedMsg[]).length - fresh.length
+      if (fresh.length) { offlineQueues.set(k, fresh); restored += fresh.length }
+    }
+    log('info', 'queue_restored', { messages: restored, expired_dropped: dropped, queues: offlineQueues.size })
+  } catch (e) { log('warn', 'queue_restore_failed', { error: String(e) }) }
+}
+
 function enqueue(room: string, targetPeer: string, senderPeer: string, data: string): boolean {
   const key = queueKey(room, targetPeer)
   let q = offlineQueues.get(key)
@@ -234,15 +268,18 @@ function enqueue(room: string, targetPeer: string, senderPeer: string, data: str
 
   q.push({ data, size: data.length, expiresAt: Date.now() + QUEUE_TTL_S * 1000, sender: senderPeer })
   msgQueued++
+  saveQueues()
   return true
 }
 
 function drainQueue(peer: Peer): void {
+  let changed = false
   for (const r of peer.rooms) {
     const key = queueKey(r, peer.name)
     const q = offlineQueues.get(key)
     if (!q || !q.length) continue
     offlineQueues.delete(key)
+    changed = true
 
     const now = Date.now()
     let drained = 0
@@ -256,15 +293,20 @@ function drainQueue(peer: Peer): void {
     }
     if (drained) log('info', 'queue_drained', { peer: peer.name, room: r, drained })
   }
+  if (changed) saveQueues()
 }
 
 const queueCleanupTimer = setInterval(() => {
   const now = Date.now()
+  let changed = false
   for (const [key, q] of offlineQueues) {
     const filtered = q.filter(m => m.expiresAt > now)
+    if (filtered.length === q.length) continue
+    changed = true
     if (!filtered.length) offlineQueues.delete(key)
     else offlineQueues.set(key, filtered)
   }
+  if (changed) saveQueues()
 }, 30_000)
 
 const pingTimer = setInterval(() => {
@@ -568,6 +610,7 @@ function broadcast(room: string, sender: string, msg: any): void {
   await sodium.ready
   relayKeys = loadOrGenRelayKeys()
   loadAllowList()
+  loadQueues()
   log('info', 'relay_identity', { fingerprint: relayFingerprint(relayKeys.publicKey) })
 
 const server = Bun.serve<WsData>({
